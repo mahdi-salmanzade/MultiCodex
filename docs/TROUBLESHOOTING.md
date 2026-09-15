@@ -36,6 +36,25 @@ Quit the profile, confirm `MULTICODEX_APP` points to the updated source, and run
 
 Sync skips profiles whose recorded version/build match and whose app exists. It is not a repair or force-rebuild command for arbitrary bundle damage. Report that case before deleting profile data.
 
+## A conversation fails with `failed to resolve rollout path`
+
+After moving an existing profile, Codex's saved conversation records can still contain absolute paths to its old home. For example, a profile moved from `~/.codex-profiles/work` to `~/.multicodex/profiles/work` may list conversations but fail to open them.
+
+First check that the exact `sessions/.../rollout-....jsonl` file from the error exists under the new profile home. If it does, restore access through the old location with a compatibility symlink. For the `work` example, when the old location is absent:
+
+```sh
+old_profile="$HOME/.codex-profiles/work"
+new_profile="$HOME/.multicodex/profiles/work"
+if [ -d "$new_profile" ] && [ ! -e "$old_profile" ] && [ ! -L "$old_profile" ]; then
+    mkdir -p "$HOME/.codex-profiles"
+    ln -s "$new_profile" "$old_profile"
+fi
+```
+
+Use the old path shown in your error and the new home for that same profile. Keep the link in place while saved records reference it. This restores access without rewriting the conversation database or copying credentials. Reopen the conversation; if the app still shows the cached error, quit the affected profile and relaunch it with `multicodex launch work`.
+
+If the old location already exists, inspect it before changing anything. If the rollout file is also missing from the new home, a symlink cannot recover it; restore it from the original profile or a backup. Changing `MULTICODEX_ROOT` or running `sync` does not migrate saved paths.
+
 ## Permissions reset or signing fails
 
 Profile app metadata changes require a new signature. `multicodex doctor` shows the selected signing identity. If no supported certificate is available, MultiCodex uses an ad-hoc signature; Accessibility or Screen Recording permissions may need to be granted again after sync.
