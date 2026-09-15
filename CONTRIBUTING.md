@@ -4,7 +4,7 @@ Thanks for helping make multiple Codex accounts easier to use on macOS.
 
 ## Development setup
 
-Clone the repository and run `./bin/multicodex --help`. The CLI uses Bash and macOS utilities; there is no application build or runtime package install. Keep `bin` and `assets` in the same checkout.
+Clone the repository and run `./bin/multicodex --help`. The CLI uses Bash and macOS utilities; optional session sharing also uses Python 3's standard library. There is no application build or runtime package install. Keep `bin`, `assets`, and `tools` in the same checkout.
 
 Run the checks from the repository root:
 
@@ -44,6 +44,7 @@ Preserve these design choices:
 - Keep account and Electron state separate, with both isolation variables supplied at launch.
 - Keep profile management local and free of telemetry or a required backend.
 - Preserve profile data during sync and require explicit confirmation before removal.
+- Keep session sharing opt-in, back up conversation databases before the first merge, and never include account/enrollment tables in the sync allowlist.
 - Document compatibility limits and distinguish local file checks from validated account status.
 
 Do not include credentials, account data, local profiles, signing keys, downloaded application bundles, or identifying logs in contributions. Original code and documentation contributions are made under the project's MIT license.

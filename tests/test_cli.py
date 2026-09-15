@@ -148,6 +148,19 @@ class CLIBehavior(unittest.TestCase):
         self.assertTrue((self.root / "launch-args").exists())
         self.assertFalse((self.root / "legacy-profiles/work").is_symlink())
 
+    def test_sessions_dispatches_explicit_pair(self):
+        self.run_shell(r'''
+python3() { printf '%s\n' "$@" > "$TEST_DIR/sync-args"; }
+main sessions enable work --with personal
+''')
+        self.assertEqual((self.root / "sync-args").read_text().splitlines()[:6], [
+            str(REPO / "tools/session_sync.py"), "enable", "--left",
+            str(self.root / "profiles/work"), "--right", str(self.root / "profiles/personal"),
+        ])
+        for command in ("main sessions", "main sessions enable", "main sessions sync ../escape",
+                        "main sessions enable work --with", "main sessions enable work --with ../escape"):
+            self.run_shell(command, success=False)
+
     def test_repair_preserves_occupied_old_paths_and_launch_continues(self):
         profile, old, relative = self.moved_session()
         old.mkdir(parents=True)

@@ -56,6 +56,23 @@ Use the old home shown in your error, belonging to that same profile. The comman
 
 If the old location already exists, inspect it before changing anything. If the rollout file is also missing from the new home, a symlink cannot recover it; restore it from the original profile or a backup. Changing `MULTICODEX_ROOT` or running `sync` does not migrate saved paths.
 
+## Shared conversations are missing or out of date
+
+Session sharing is opt-in. `multicodex sync` updates application bundles; it does not share chats. For Default Codex and Work, run:
+
+```sh
+multicodex sessions enable work
+multicodex sessions status work
+```
+
+Use the same `--with <peer>` argument for `sync`, `enable`, `status`, and `disable` when sharing two named profiles. The first run creates SQLite backups before merging. The agent repeats every 15 seconds while logged in and runs at login. macOS may delay background work or suspend it during sleep. `status` shows the last successful pass and the latest error, if any; its output includes the backup/log directory. Reopen Codex once if the imported chats are not visible in a cached sidebar.
+
+The sync helper requires Python 3 and the repository's `tools/session_sync.py`. Keep the checkout and Python installation in place. If either moves, run `enable` again from the new checkout. If the two apps use different database schemas, sync stops before importing; update both apps, then rerun it. The integration uses Codex's local SQLite schema and may need an update after a Codex release.
+
+Conversation files stay in their original profile homes and are referenced by both apps. Keep both homes and any legacy compatibility links available. Disabling sync leaves the imported conversations and these references in place. Backups include the indexes and paginated message history, not all attachments or rollout files; use a full profile backup before moving or removing either home.
+
+Titles, pins, archive state, project metadata, and section assignments are merged. If both apps edit the same metadata between passes, the newest timestamp wins; ties prefer the home that sorts first by path. Deletions are not propagated: use Archive to hide a conversation in both apps. Avoid running the same conversation simultaneously in both apps, since their task execution and writer locks remain separate. Sharing history does not move running tasks, scheduled jobs, authentication, or account settings between apps.
+
 ## Permissions reset or signing fails
 
 Profile app metadata changes require a new signature. `multicodex doctor` shows the selected signing identity. If no supported certificate is available, MultiCodex uses an ad-hoc signature; Accessibility or Screen Recording permissions may need to be granted again after sync.

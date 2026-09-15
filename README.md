@@ -157,6 +157,10 @@ There is no build step. Updating MultiCodex and updating the official app are se
 | `multicodex list` | Show profiles, colors, local auth-file presence, and sync status. Alias: `ls`. |
 | `multicodex sync [name]` | Rebuild stale or missing profile apps from the installed source app. |
 | `multicodex repair <name> [--from /old/profile/home]` | Restore access to sessions after moving a profile; defaults to the old `~/.codex-profiles/<name>` location. |
+| `multicodex sessions sync <name> [--with <peer>]` | Sync conversations and message history both ways with `default` Codex or a named peer. Requires Python 3. |
+| `multicodex sessions enable <name> [--with <peer>]` | Sync now and install a local agent that repeats every 15 seconds and at login. |
+| `multicodex sessions disable <name> [--with <peer>]` | Stop the pair's automatic sync, retaining conversations and backups. |
+| `multicodex sessions status <name> [--with <peer>]` | Show whether the agent is loaded, the last successful sync, and any last-attempt error. |
 | `multicodex remove <name>` | Permanently delete the profile app and its local data after you type the profile name to confirm. Alias: `rm`. |
 | `multicodex colors` | List the ten colors. Alias: `colours`. |
 | `multicodex doctor` | Report installation, signing, icons, and filesystem details. |
@@ -184,6 +188,21 @@ MultiCodex performs cloning, branding, signing, profile storage, and launching o
 Back up profile data before removing a profile. `remove` deletes its local credentials, conversations, settings, and app; it does not delete the account at OpenAI.
 
 When launching a moved profile, MultiCodex checks its conversation index for old `~/.codex-profiles/<name>` paths. If a referenced session exists in the current home, it restores the old location with a compatibility symlink. Existing directories and conflicting links are preserved. This check uses macOS's `sqlite3`; if unavailable, use `repair` explicitly. See [session path recovery](docs/TROUBLESHOOTING.md#a-conversation-fails-with-failed-to-resolve-rollout-path).
+
+### Optional shared conversations
+
+Profiles have separate conversation stores by default. To share Default Codex and a `work` profile on the same Mac:
+
+```sh
+multicodex sessions enable work
+multicodex sessions status work
+```
+
+New conversations, message history, titles, archive state, project records, and section assignments sync in both directions. Use `--with personal` to select another named profile instead of Default Codex. Account credentials, settings, remote-control enrollment, scheduled jobs, and other account state remain separate. Stop automatic sync with `multicodex sessions disable work`.
+
+The first run backs up both conversation indexes and message-history databases under `~/.multicodex/session-sync`. It then merges an explicit set of conversation tables using SQLite transactions. Both profiles reference the original session files by absolute path; keep both profile homes in place. The helper does not copy the potentially large rollout files. Existing history databases are copied into the backup, and missing history is imported into the peer, so the first sync needs additional disk space and may take longer.
+
+Automatic sync runs through a macOS LaunchAgent while you are logged in. Keep Python 3 and this checkout's `tools` directory available. After the first import, reopen the app if its sidebar is cached. See [sync behavior and limitations](docs/TROUBLESHOOTING.md#shared-conversations-are-missing-or-out-of-date).
 
 ## Configuration
 

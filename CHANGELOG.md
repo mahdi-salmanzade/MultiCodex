@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add opt-in two-way conversation sharing with `sessions sync/enable/disable/status`, including paginated message history and a 15-second macOS LaunchAgent.
+- Back up conversation databases before sharing, retain separate account state, and report schema mismatches and sync failures.
 - Restore moved session paths with `repair <name> [--from /old/profile/home]`.
 - Automatically recover the legacy `.codex-profiles` layout on launch when the conversation index and existing session files establish the moved profile's location.
 - Preserve occupied old paths and keep launch working if automatic recovery is unavailable.
