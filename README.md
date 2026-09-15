@@ -156,6 +156,7 @@ There is no build step. Updating MultiCodex and updating the official app are se
 | `multicodex launch --all` | Start every profile in sequence, skipping those already running. Aliases: `launch -a`, `open-all`, `openall`. |
 | `multicodex list` | Show profiles, colors, local auth-file presence, and sync status. Alias: `ls`. |
 | `multicodex sync [name]` | Rebuild stale or missing profile apps from the installed source app. |
+| `multicodex repair <name> [--from /old/profile/home]` | Restore access to sessions after moving a profile; defaults to the old `~/.codex-profiles/<name>` location. |
 | `multicodex remove <name>` | Permanently delete the profile app and its local data after you type the profile name to confirm. Alias: `rm`. |
 | `multicodex colors` | List the ten colors. Alias: `colours`. |
 | `multicodex doctor` | Report installation, signing, icons, and filesystem details. |
@@ -181,6 +182,8 @@ MultiCodex performs cloning, branding, signing, profile storage, and launching o
 | `~/.codex` | Default Codex home, shown as `default` in the list. Profile commands do not modify it. |
 
 Back up profile data before removing a profile. `remove` deletes its local credentials, conversations, settings, and app; it does not delete the account at OpenAI.
+
+When launching a moved profile, MultiCodex checks its conversation index for old `~/.codex-profiles/<name>` paths. If a referenced session exists in the current home, it restores the old location with a compatibility symlink. Existing directories and conflicting links are preserved. This check uses macOS's `sqlite3`; if unavailable, use `repair` explicitly. See [session path recovery](docs/TROUBLESHOOTING.md#a-conversation-fails-with-failed-to-resolve-rollout-path).
 
 ## Configuration
 

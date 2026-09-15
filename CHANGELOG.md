@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Restore moved session paths with `repair <name> [--from /old/profile/home]`.
+- Automatically recover the legacy `.codex-profiles` layout on launch when the conversation index and existing session files establish the moved profile's location.
+- Preserve occupied old paths and keep launch working if automatic recovery is unavailable.
+
 ## 1.0.0 — 2026-09-16
 
 Initial public release.

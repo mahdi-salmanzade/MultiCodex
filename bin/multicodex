@@ -55,6 +55,7 @@ valid_color() {
 }
 
 codex_home()  { printf '%s/%s\n' "$PROFILE_ROOT" "$1"; }
+legacy_codex_home() { printf '%s/.codex-profiles/%s\n' "$HOME" "$1"; }
 data_dir()    { printf '%s/%s\n' "$DATA_ROOT" "$1"; }
 profile_app() { printf '%s/Codex %s.app\n' "$APP_DIR" "$1"; }
 meta_file()   { printf '%s/%s/.multicodex\n' "$PROFILE_ROOT" "$1"; }
@@ -310,6 +311,83 @@ cmd_sync() {
 
 # ---------------------------------------------------------------- run
 
+# Preserve absolute paths stored by Codex after a profile home has been moved.
+# A link also repairs references outside the conversation index, without editing
+# a database that may be open in a running app.
+repair_profile_paths() {
+    local name="$1" old_home="$2" profile_home parent
+    profile_home="$(codex_home "$name")"
+    [ -d "$profile_home" ] || die "no profile named '$name'"
+    profile_home="$(cd -- "$profile_home" && pwd -P)"
+    case "$old_home" in
+        /*) ;;
+        *) die "old profile home must be an absolute path" ;;
+    esac
+    if [ "$old_home" -ef "$profile_home" ]; then
+        ok "$name: old profile path already resolves to the current home"
+        return 0
+    fi
+    if [ -e "$old_home" ] || [ -L "$old_home" ]; then
+        die "old profile path is occupied: $old_home — inspect it before repairing"
+    fi
+    [ -d "$profile_home/sessions" ] || [ -d "$profile_home/archived_sessions" ] \
+        || die "no session directory in $profile_home — restore the moved profile first"
+
+    parent="$(dirname -- "$old_home")"
+    mkdir -p "$parent"
+    parent="$(cd -- "$parent" && pwd -P)"
+    case "$parent/" in
+        "$profile_home/"*) die "old profile path cannot be inside the current profile home" ;;
+    esac
+    ln -s "$profile_home" "$old_home" || die "could not restore old profile path: $old_home"
+    ok "$name: restored $old_home -> $profile_home"
+}
+
+cmd_repair() {
+    local name="${1:-}" old_home
+    [ -n "$name" ] || die "usage: multicodex repair <name> [--from /old/profile/home]"
+    valid_name "$name" || die "invalid name '$name'"
+    shift
+    old_home="$(legacy_codex_home "$name")"
+    if [ $# -gt 0 ]; then
+        [ $# -eq 2 ] && [ "$1" = "--from" ] \
+            || die "usage: multicodex repair <name> [--from /old/profile/home]"
+        old_home="$2"
+    fi
+    repair_profile_paths "$name" "$old_home"
+}
+
+# Only auto-link the legacy layout when the current profile's own index points
+# there and the corresponding session file is present in this profile. Fresh
+# profiles must not claim another profile's former location just by name.
+repair_legacy_paths_on_launch() {
+    local name="$1" profile_home old_home db paths path relative quoted_old
+    profile_home="$(codex_home "$name")"
+    old_home="$(legacy_codex_home "$name")"
+    [ "$old_home" -ef "$profile_home" ] && return 0
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    quoted_old="$(printf '%s' "$old_home/" | sed "s/'/''/g")"
+    for db in "$profile_home"/state_*.sqlite; do
+        [ -f "$db" ] || continue
+        paths="$(sqlite3 -readonly "$db" \
+            "SELECT rollout_path FROM threads WHERE instr(rollout_path, '$quoted_old') = 1;" 2>/dev/null)" || continue
+        while IFS= read -r path; do
+            relative="${path#"$old_home/"}"
+            case "$relative" in
+                *../*) continue ;;
+                sessions/*|archived_sessions/*) ;;
+                *) continue ;;
+            esac
+            [ -f "$profile_home/$relative" ] || continue
+            if ! (repair_profile_paths "$name" "$old_home"); then
+                warn "$name: legacy session paths could not be repaired; inspect the old location, then run: multicodex repair $name"
+            fi
+            return 0
+        done <<< "$paths"
+    done
+    return 0
+}
+
 cmd_launch() {
     local name="${1:-}"
     [ -n "$name" ] || die "usage: multicodex launch <name>"
@@ -321,6 +399,7 @@ cmd_launch() {
     [ -d "$app" ] || die "profile app missing — run: multicodex sync $name"
     mkdir -p "$profile_home" "$data"
     chmod 700 "$profile_home" "$data"
+    repair_legacy_paths_on_launch "$name"
 
     # Launch through `open -n` so the app is adopted by launchd rather than
     # parented to this shell. Exec'ing the binary directly works, but ties the
@@ -456,6 +535,7 @@ multicodex $VERSION — several ChatGPT/Codex accounts on one Mac
   multicodex launch --all               launch every profile
   multicodex list                       list profiles and their state
   multicodex sync [name]                rebuild profiles after a ChatGPT update
+  multicodex repair <name> [--from path] restore access after moving a profile
   multicodex remove <name>              delete a profile
   multicodex colors                     show available colours
   multicodex doctor                     check the installation
@@ -478,6 +558,7 @@ main() {
             else cmd_launch "$@"; fi ;;
         open-all|openall) cmd_launch_all ;;
         sync)    cmd_sync "$@" ;;
+        repair)  cmd_repair "$@" ;;
         list|ls) cmd_list "$@" ;;
         remove|rm) cmd_remove "$@" ;;
         colors|colours) cmd_colors "$@" ;;

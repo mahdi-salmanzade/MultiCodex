@@ -40,18 +40,19 @@ Sync skips profiles whose recorded version/build match and whose app exists. It 
 
 After moving an existing profile, Codex's saved conversation records can still contain absolute paths to its old home. For example, a profile moved from `~/.codex-profiles/work` to `~/.multicodex/profiles/work` may list conversations but fail to open them.
 
-First check that the exact `sessions/.../rollout-....jsonl` file from the error exists under the new profile home. If it does, restore access through the old location with a compatibility symlink. For the `work` example, when the old location is absent:
+Launching through MultiCodex automatically repairs the old `~/.codex-profiles/<name>` layout when the profile's conversation index references it and a matching session file exists in the current home. To repair a profile that is already running:
 
 ```sh
-old_profile="$HOME/.codex-profiles/work"
-new_profile="$HOME/.multicodex/profiles/work"
-if [ -d "$new_profile" ] && [ ! -e "$old_profile" ] && [ ! -L "$old_profile" ]; then
-    mkdir -p "$HOME/.codex-profiles"
-    ln -s "$new_profile" "$old_profile"
-fi
+multicodex repair work
 ```
 
-Use the old path shown in your error and the new home for that same profile. Keep the link in place while saved records reference it. This restores access without rewriting the conversation database or copying credentials. Reopen the conversation; if the app still shows the cached error, quit the affected profile and relaunch it with `multicodex launch work`.
+For a different old location, first check that the exact `sessions/.../rollout-....jsonl` file from the error exists in the current profile home, then run:
+
+```sh
+multicodex repair work --from /absolute/path/to/old/work
+```
+
+Use the old home shown in your error, belonging to that same profile. The command creates a compatibility symlink and refuses to replace an occupied path. Keep the link in place while saved records reference it. This restores access without rewriting the conversation database or copying credentials. Reopen the conversation; if the app still shows the cached error, quit the affected profile and relaunch it with `multicodex launch work`.
 
 If the old location already exists, inspect it before changing anything. If the rollout file is also missing from the new home, a symlink cannot recover it; restore it from the original profile or a backup. Changing `MULTICODEX_ROOT` or running `sync` does not migrate saved paths.
 

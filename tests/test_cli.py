@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ CLI = REPO / "bin" / "multicodex"
 # Real command handlers, with app operations redirected to a temporary sandbox.
 HARNESS = r'''
 source "$TEST_CLI"
+legacy_codex_home() { printf '%s/legacy-profiles/%s\n' "$TEST_DIR" "$1"; }
 data_dir() { printf '%s/data/%s\n' "$TEST_DIR" "$1"; }
 profile_app() { printf '%s/apps/Codex %s.app\n' "$TEST_DIR" "$1"; }
 app_version() { printf '1.2.3\n'; }
@@ -97,6 +99,100 @@ class CLIBehavior(unittest.TestCase):
                 f"--user-data-dir={self.root}/data/{name}",
             ])
         self.assertEqual(args, expected)
+
+    def moved_session(self, *, archived=False):
+        self.create()
+        profile = self.root / "profiles/work"
+        old = self.root / "legacy-profiles/work"
+        relative = Path("archived_sessions" if archived else "sessions") / "rollout-test.jsonl"
+        session = profile / relative
+        session.parent.mkdir()
+        session.write_text('{"type":"session_meta"}\n')
+        with sqlite3.connect(profile / "state_5.sqlite") as db:
+            db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT)")
+            db.execute("INSERT INTO threads VALUES (?, ?)", ("test", str(old / relative)))
+        return profile, old, relative
+
+    def test_launch_repairs_moved_session_without_rewriting_database(self):
+        profile, old, relative = self.moved_session()
+        original_db = (profile / "state_5.sqlite").read_bytes()
+        self.assertFalse((old / relative).exists())
+        self.run_shell("main launch work")
+        self.assertEqual((old / relative).read_bytes(), (profile / relative).read_bytes())
+        self.assertEqual(old.resolve(), profile.resolve())
+        self.assertEqual((profile / "state_5.sqlite").read_bytes(), original_db)
+        self.run_shell("main launch work; main repair work")
+        self.assertEqual(old.resolve(), profile.resolve())
+
+    def test_launch_repairs_archived_sessions(self):
+        profile, old, relative = self.moved_session(archived=True)
+        self.run_shell("main launch work")
+        self.assertEqual((old / relative).read_bytes(), (profile / relative).read_bytes())
+
+    def test_launch_does_not_claim_old_path_without_matching_session(self):
+        profile, old, relative = self.moved_session()
+        (profile / relative).unlink()
+        self.run_shell("main launch work")
+        self.assertFalse(old.is_symlink())
+        # An index belonging to a different old profile must not claim this name.
+        (profile / relative).write_text("session")
+        with sqlite3.connect(profile / "state_5.sqlite") as db:
+            db.execute("UPDATE threads SET rollout_path = ?", (str(old.parent / "personal" / relative),))
+        self.run_shell("main launch work")
+        self.assertFalse(old.is_symlink())
+
+    def test_launch_without_readable_index_still_opens_app(self):
+        self.create()
+        (self.root / "profiles/work/state_5.sqlite").write_text("invalid database")
+        self.run_shell("main launch work")
+        self.assertTrue((self.root / "launch-args").exists())
+        self.assertFalse((self.root / "legacy-profiles/work").is_symlink())
+
+    def test_repair_preserves_occupied_old_paths_and_launch_continues(self):
+        profile, old, relative = self.moved_session()
+        old.mkdir(parents=True)
+        sentinel = old / "keep.txt"
+        sentinel.write_text("other data")
+        self.run_shell("main repair work", success=False)
+        result = self.run_shell("main launch work")
+        self.assertIn("occupied", result.stderr)
+        self.assertEqual(sentinel.read_text(), "other data")
+        sentinel.unlink()
+        old.rmdir()
+        for destination in (self.root / "missing", self.root / "source.app"):
+            with self.subTest(destination=destination):
+                old.symlink_to(destination, target_is_directory=True)
+                self.run_shell("main repair work", success=False)
+                self.assertEqual(old.readlink(), destination)
+                old.unlink()
+
+    def test_repair_accepts_custom_old_home_with_spaces_and_quotes(self):
+        profile, _, relative = self.moved_session()
+        old = self.root / "old user's profiles" / "work"
+        self.env["TEST_OLD_HOME"] = str(old)
+        self.run_shell('main repair work --from "$TEST_OLD_HOME"')
+        self.assertEqual((old / relative).read_bytes(), (profile / relative).read_bytes())
+        self.run_shell('main repair work --from "$TEST_OLD_HOME"')
+
+    def test_launch_handles_quoted_legacy_path(self):
+        profile, _, relative = self.moved_session()
+        old = self.root / "old user's profiles" / "work"
+        self.env["TEST_OLD_HOME"] = str(old)
+        with sqlite3.connect(profile / "state_5.sqlite") as db:
+            db.execute("UPDATE threads SET rollout_path = ?", (str(old / relative),))
+        self.run_shell('legacy_codex_home() { printf "%s\\n" "$TEST_OLD_HOME"; }; main launch work')
+        self.assertEqual((old / relative).read_bytes(), (profile / relative).read_bytes())
+
+    def test_repair_rejects_missing_sessions_and_invalid_arguments(self):
+        self.create()
+        for command in (
+            "main repair", "main repair ../escape", "main repair absent",
+            "main repair work --from", "main repair work --unknown /old",
+            "main repair work --from relative/path", "main repair work",
+        ):
+            with self.subTest(command=command):
+                self.run_shell(command, success=False)
+        self.assertFalse((self.root / "legacy-profiles").exists())
 
     def test_sync_detects_new_build_and_preserves_data(self):
         self.create()
