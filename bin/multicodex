@@ -1,0 +1,493 @@
+#!/bin/bash
+# multicodex — install ChatGPT/Codex and run several isolated accounts on one Mac.
+#
+# Each profile is an APFS clone of the official app, rebranded with its own name,
+# colour and bundle identifier, then re-signed so macOS treats it as a distinct
+# application: separate Dock tile, separate Cmd-Tab entry, separate privacy
+# grants. Cloning is copy-on-write, so a profile costs seconds and almost no disk.
+#
+# Account isolation uses ChatGPT's own mechanism: CODEX_HOME for credentials and
+# CODEX_ELECTRON_USER_DATA_PATH for the Electron profile. The second variable is
+# not optional — without it the app's login-shell environment load overwrites
+# CODEX_HOME and every profile silently collapses back onto ~/.codex.
+#
+# After the official app updates, `multicodex sync` re-clones each profile.
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly APP="${MULTICODEX_APP:-/Applications/ChatGPT.app}"
+readonly DOWNLOAD_URL="https://persistent.oaistatic.com/sidekick/public/ChatGPT.dmg"
+readonly OPENAI_TEAM_ID="2DC432GLL2"
+readonly OPENAI_BUNDLE_ID="com.openai.codex"
+
+readonly PROFILE_ROOT="${MULTICODEX_ROOT:-$HOME/.multicodex/profiles}"
+readonly DATA_ROOT="$HOME/Library/Application Support/MultiCodex"
+readonly APP_DIR="$HOME/Applications"
+
+SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly ICON_DIR="${MULTICODEX_ICONS:-$SELF/assets/icons}"
+
+readonly COLORS="blue green purple orange red teal pink yellow indigo graphite"
+readonly LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+# ---------------------------------------------------------------- output
+
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+info() { printf '  %s\n' "$1"; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$1" >&2; }
+die()  { printf '\033[31mmulticodex:\033[0m %s\n' "$1" >&2; exit 1; }
+
+# ---------------------------------------------------------------- helpers
+
+valid_name() {
+    case "$1" in
+        ""|*/*|.|..) return 1 ;;
+        *) printf '%s' "$1" | grep -qE '^[A-Za-z0-9._-]+$' ;;
+    esac
+}
+
+valid_color() {
+    local c
+    for c in $COLORS; do [ "$c" = "$1" ] && return 0; done
+    return 1
+}
+
+codex_home()  { printf '%s/%s\n' "$PROFILE_ROOT" "$1"; }
+data_dir()    { printf '%s/%s\n' "$DATA_ROOT" "$1"; }
+profile_app() { printf '%s/Codex %s.app\n' "$APP_DIR" "$1"; }
+meta_file()   { printf '%s/%s/.multicodex\n' "$PROFILE_ROOT" "$1"; }
+
+meta_get() {
+    local f
+    f="$(meta_file "$1")"
+    [ -f "$f" ] && sed -n "s/^$2=//p" "$f" | head -1 || true
+}
+
+app_version() {
+    defaults read "$1/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo unknown
+}
+
+app_build() {
+    defaults read "$1/Contents/Info.plist" CFBundleVersion 2>/dev/null || echo unknown
+}
+
+next_color() {
+    local c used="" dir
+    if [ -d "$PROFILE_ROOT" ]; then
+        for dir in "$PROFILE_ROOT"/*/; do
+            [ -d "$dir" ] || continue
+            [ -f "$dir/.multicodex" ] && used="$used $(sed -n 's/^color=//p' "$dir/.multicodex" | head -1)"
+        done
+    fi
+    for c in $COLORS; do
+        case " $used " in *" $c "*) ;; *) printf '%s\n' "$c"; return ;; esac
+    done
+    printf 'blue\n'
+}
+
+require_app() { [ -d "$APP" ] || die "ChatGPT is not installed. Run: multicodex install"; }
+
+# True when a profile's own application is running. Matching on the bundle path
+# avoids false positives from its Computer Use helper, which lives under the
+# profile directory and outlives the app.
+profile_running() {
+    ps -axo comm= 2>/dev/null | awk -v prefix="$(profile_app "$1")/Contents/MacOS/" '
+        index($0, prefix) == 1 {
+            executable = substr($0, length(prefix) + 1)
+            if (executable != "" && index(executable, "/") == 0) found = 1
+        }
+        END { exit !found }
+    '
+}
+
+# The Dock caches icons per bundle path, so replacing an app in place leaves the
+# previous artwork on screen. Restarting the Dock is the only reliable refresh;
+# it is instant and loses nothing.
+refresh_icon_cache() {
+    killall Dock >/dev/null 2>&1 || true
+}
+
+# Prefer a team-backed certificate: ad-hoc signatures change on every re-sign,
+# which makes macOS forget the privacy grants a profile has been given.
+signing_identity() {
+    if [ -n "${MULTICODEX_SIGNING_IDENTITY:-}" ]; then
+        printf '%s\n' "$MULTICODEX_SIGNING_IDENTITY"; return
+    fi
+    local line
+    for prefix in "Developer ID Application:" "Apple Development:"; do
+        line="$(security find-identity -v -p codesigning 2>/dev/null | grep -F "$prefix" | head -1 || true)"
+        if [ -n "$line" ]; then
+            printf '%s\n' "$line" | sed -E 's/^[^"]*"([^"]+)".*$/\1/'
+            return
+        fi
+    done
+    printf -- '-\n'
+}
+
+# ---------------------------------------------------------------- install
+
+verify_openai_bundle() {
+    local bundle="$1" team identifier
+    codesign --verify --strict "$bundle" 2>/dev/null \
+        || die "downloaded app failed signature verification"
+    team="$(codesign -dv --verbose=4 "$bundle" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+    identifier="$(codesign -dv --verbose=4 "$bundle" 2>&1 | sed -n 's/^Identifier=//p')"
+    [ "$team" = "$OPENAI_TEAM_ID" ] \
+        || die "unexpected signing team '$team' (expected $OPENAI_TEAM_ID) — refusing to install"
+    [ "$identifier" = "$OPENAI_BUNDLE_ID" ] \
+        || die "unexpected bundle id '$identifier' — refusing to install"
+    ok "signature: Developer ID, team $team"
+}
+
+cmd_install() {
+    bold "Installing ChatGPT (Codex) desktop"
+    if [ -d "$APP" ]; then
+        info "already installed: $(app_version "$APP")"
+        printf '  Reinstall the latest build? [y/N] '
+        local reply; read -r reply
+        case "$reply" in [yY]*) ;; *) info "keeping the existing installation"; return 0 ;; esac
+    fi
+
+    local tmp dmg mount staged
+    tmp="$(mktemp -d)"; dmg="$tmp/ChatGPT.dmg"; mount="$tmp/mnt"
+    # shellcheck disable=SC2064
+    trap "hdiutil detach '$mount' -quiet 2>/dev/null || true; rm -rf '$tmp'" EXIT
+    mkdir -p "$mount"
+
+    info "downloading"
+    curl -fL --progress-bar "$DOWNLOAD_URL" -o "$dmg" || die "download failed"
+    ok "downloaded $(du -h "$dmg" | cut -f1)"
+
+    hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount" -quiet \
+        || die "could not mount the disk image"
+    staged="$(find "$mount" -maxdepth 1 -name '*.app' -print -quit)"
+    [ -n "$staged" ] || die "no application found inside the disk image"
+
+    info "verifying signature before install"
+    verify_openai_bundle "$staged"
+
+    info "copying to $APP"
+    if [ -w "$(dirname "$APP")" ]; then
+        rm -rf "$APP"; cp -R "$staged" "$APP"
+    else
+        warn "administrator password required for $(dirname "$APP")"
+        sudo rm -rf "$APP"; sudo cp -R "$staged" "$APP"
+    fi
+    ok "installed ChatGPT $(app_version "$APP")"
+    printf '\n'; info "next: multicodex create work"
+}
+
+# ---------------------------------------------------------------- build
+
+# Clone, rebrand and re-sign one profile application.
+build_profile_app() {
+    local name="$1" color="$2" target
+    target="$(profile_app "$name")"
+
+    local identity
+    identity="$(signing_identity)"
+    [ "$identity" = "-" ] && warn "no signing certificate found; using an ad-hoc signature (privacy grants may reset on each sync)"
+
+    info "cloning $(app_version "$APP") (copy-on-write)"
+    mkdir -p "$APP_DIR"
+    rm -rf "$target"
+    cp -Rc "$APP" "$target" 2>/dev/null || cp -R "$APP" "$target"
+
+    local plist="$target/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleName Codex $name" "$plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Codex $name" "$plist" >/dev/null 2>&1 \
+        || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Codex $name" "$plist" >/dev/null 2>&1 || true
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier local.multicodex.$name" "$plist" >/dev/null 2>&1 || true
+
+    local icon_src icon_name
+    icon_src="$ICON_DIR/multicodex-$color.icns"
+    icon_name="$(defaults read "$plist" CFBundleIconFile 2>/dev/null || echo electron)"
+    icon_name="${icon_name%.icns}"
+    if [ -f "$icon_src" ]; then
+        cp "$icon_src" "$target/Contents/Resources/$icon_name.icns"
+        # CFBundleIconName resolves through Assets.car and takes priority over
+        # CFBundleIconFile. The official app sets both, and its catalog carries a
+        # dark-appearance variant, so leaving the key in place means the Dock
+        # keeps drawing the stock icon and ignores the .icns entirely.
+        /usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" "$plist" >/dev/null 2>&1 || true
+        ok "icon: $color"
+    else
+        warn "icon for '$color' missing — run: python3 tools/make_icons.py"
+    fi
+
+    info "re-signing as '$identity'"
+    codesign --force --deep --sign "$identity" "$target" >/dev/null 2>&1 \
+        || die "codesign failed for $target"
+    codesign --verify --deep --strict "$target" >/dev/null 2>&1 \
+        || die "signature verification failed for $target"
+    ok "signed and verified"
+
+    [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$target" >/dev/null 2>&1 || true
+    printf '%s\n' "$target"
+}
+
+cmd_create() {
+    local name="" color=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --color) [ $# -ge 2 ] && [ -n "$2" ] || die "--color requires a value"; color="$2"; shift 2 ;;
+            --color=*) color="${1#--color=}"; shift ;;
+            -*) die "unknown option: $1" ;;
+            *) [ -z "$name" ] || die "specify one profile name"; name="$1"; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: multicodex create <name> [--color <colour>]"
+    valid_name "$name" || die "invalid name '$name' (letters, digits, . _ - only)"
+    require_app
+    [ -d "$(codex_home "$name")" ] && die "profile '$name' already exists"
+
+    [ -n "$color" ] || color="$(next_color)"
+    valid_color "$color" || die "unknown colour '$color' (see: multicodex colors)"
+
+    bold "Creating profile '$name'"
+    local profile_home data app
+    profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"
+    mkdir -p "$profile_home" "$data"
+    chmod 700 "$profile_home" "$data"
+    build_profile_app "$name" "$color"
+    app="$(profile_app "$name")"
+
+    printf 'color=%s\nsource_version=%s\nsource_build=%s\n' "$color" "$(app_version "$APP")" "$(app_build "$APP")" > "$(meta_file "$name")"
+
+    printf '\n'
+    ok "app         $app"
+    ok "codex home  $profile_home"
+    refresh_icon_cache
+
+    printf '\n'
+    info "launch:  multicodex launch $name"
+    info "always launch through multicodex so this profile receives its isolated settings"
+}
+
+cmd_sync() {
+    [ $# -le 1 ] || die "usage: multicodex sync [name]"
+    if [ $# -eq 1 ]; then valid_name "$1" || die "invalid name '$1'"; fi
+    require_app
+    local current current_build targets name
+    current="$(app_version "$APP")"
+    current_build="$(app_build "$APP")"
+    bold "Syncing profiles to ChatGPT $current"
+
+    if [ $# -ge 1 ]; then targets="$1"; else
+        targets=""
+        [ -d "$PROFILE_ROOT" ] && for d in "$PROFILE_ROOT"/*/; do
+            [ -d "$d" ] && targets="$targets $(basename "$d")"
+        done
+    fi
+    [ -n "${targets// /}" ] || { info "no profiles to sync"; return 0; }
+
+    for name in $targets; do
+        valid_name "$name" || { warn "skipping invalid profile name '$name'"; continue; }
+        [ -d "$(codex_home "$name")" ] || { warn "no profile '$name'"; continue; }
+        local was color
+        was="$(meta_get "$name" source_version)"
+        color="$(meta_get "$name" color)"
+        if [ -z "$color" ]; then
+            # No colour on record (an older layout, or hand-made directory).
+            # Claim an unused one so profiles stay visually distinct instead of
+            # all collapsing onto the same default.
+            color="$(next_color)"
+            printf 'color=%s\n' "$color" > "$(meta_file "$name")"
+        fi
+        if [ "$was" = "$current" ] && [ "$(meta_get "$name" source_build)" = "$current_build" ] && [ -d "$(profile_app "$name")" ]; then
+            ok "$name already on $current"
+            continue
+        fi
+        printf '\n'; bold "  $name ($was -> $current)"
+        build_profile_app "$name" "$color" >/dev/null
+        printf 'color=%s\nsource_version=%s\nsource_build=%s\n' "$color" "$current" "$current_build" > "$(meta_file "$name")"
+        ok "$name updated"
+    done
+    refresh_icon_cache
+}
+
+# ---------------------------------------------------------------- run
+
+cmd_launch() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: multicodex launch <name>"
+    valid_name "$name" || die "invalid name '$name'"
+
+    local profile_home data app
+    profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"; app="$(profile_app "$name")"
+    [ -d "$profile_home" ] || die "no profile named '$name' (create it: multicodex create $name)"
+    [ -d "$app" ] || die "profile app missing — run: multicodex sync $name"
+    mkdir -p "$profile_home" "$data"
+    chmod 700 "$profile_home" "$data"
+
+    # Launch through `open -n` so the app is adopted by launchd rather than
+    # parented to this shell. Exec'ing the binary directly works, but ties the
+    # app's lifetime to the caller: close the terminal, or background the
+    # command, and the profile dies with it.
+    open -n \
+        --env "CODEX_HOME=$profile_home" \
+        --env "CODEX_ELECTRON_USER_DATA_PATH=$data" \
+        "$app" --args --user-data-dir="$data" \
+        || die "could not launch $app"
+}
+
+# Launching several profiles at once loses most of them: they race during
+# startup and exit cleanly. Waiting for each to come up before starting the next
+# is reliable and costs only a couple of seconds per profile.
+cmd_launch_all() {
+    local started=0 failed=0 name i dir
+    [ -d "$PROFILE_ROOT" ] || die "no profiles yet (create one: multicodex create work)"
+    bold "Launching all profiles"
+    for dir in "$PROFILE_ROOT"/*/; do
+        [ -d "$dir" ] || continue
+        name="$(basename "$dir")"
+        if profile_running "$name"; then ok "$name already running"; continue; fi
+        if ! (cmd_launch "$name") >/dev/null 2>&1; then
+            warn "$name could not launch"
+            failed=$((failed+1))
+            continue
+        fi
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            sleep 2
+            if profile_running "$name"; then ok "$name up"; started=$((started+1)); break; fi
+            if [ $i -eq 15 ]; then warn "$name did not start"; failed=$((failed+1)); fi
+        done
+    done
+    printf '\n'
+    info "$started started, $failed failed"
+    [ "$failed" -eq 0 ]
+}
+
+cmd_list() {
+    local current="" current_build=""
+    if [ -d "$APP" ]; then current="$(app_version "$APP")"; current_build="$(app_build "$APP")"; fi
+    printf '%-14s %-10s %-8s %-12s %s\n' "PROFILE" "COLOUR" "AUTH" "VERSION" "STATUS"
+    printf '%-14s %-10s %-8s %-12s %s\n' "default" "-" \
+        "$([ -f "$HOME/.codex/auth.json" ] && echo yes || echo no)" "$current" "official app"
+
+    [ -d "$PROFILE_ROOT" ] || return 0
+    local dir name ver status
+    for dir in "$PROFILE_ROOT"/*/; do
+        [ -d "$dir" ] || continue
+        name="$(basename "$dir")"
+        if [ -d "$(profile_app "$name")" ]; then
+            ver="$(meta_get "$name" source_version)"
+            if [ "$ver" = "$current" ] && [ "$(meta_get "$name" source_build)" = "$current_build" ]; then
+                status="up to date"
+            else
+                status="stale — run sync"
+            fi
+        else
+            ver="-"; status="app missing — run sync"
+        fi
+        printf '%-14s %-10s %-8s %-12s %s\n' "$name" "$(meta_get "$name" color)" \
+            "$([ -f "$dir/auth.json" ] && echo yes || echo no)" "$ver" "$status"
+    done
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: multicodex remove <name>"
+    valid_name "$name" || die "invalid name '$name'"
+    local profile_home data app
+    profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"; app="$(profile_app "$name")"
+    [ -d "$profile_home" ] || die "no profile named '$name'"
+
+    printf 'This permanently deletes:\n  %s\n  %s\n' "$profile_home" "$data"
+    [ -d "$app" ] && printf '  %s\n' "$app"
+    printf 'Type the profile name to confirm: '
+    local reply; read -r reply
+    [ "$reply" = "$name" ] || die "cancelled"
+    rm -rf "$profile_home" "$data" "$app"
+    ok "removed profile '$name'"
+}
+
+cmd_colors() {
+    bold "Available colours"
+    local c
+    for c in $COLORS; do
+        [ -f "$ICON_DIR/multicodex-$c.icns" ] \
+            && printf '  %-10s ✓\n' "$c" \
+            || printf '  %-10s (missing — run tools/make_icons.py)\n' "$c"
+    done
+}
+
+cmd_doctor() {
+    bold "multicodex $VERSION"
+    if [ -d "$APP" ]; then
+        ok "ChatGPT $(app_version "$APP")"
+        local team
+        team="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+        if [ "$team" = "$OPENAI_TEAM_ID" ]; then
+            ok "official app signed by OpenAI ($team)"
+        else
+            warn "unexpected signing team: $team"
+        fi
+    else
+        warn "ChatGPT not installed — run: multicodex install"
+    fi
+
+    local identity; identity="$(signing_identity)"
+    if [ "$identity" = "-" ]; then
+        warn "no signing certificate (ad-hoc only)"
+    else
+        ok "signing identity: $identity"
+    fi
+
+    local n=0 icons=0
+    [ -d "$PROFILE_ROOT" ] && n="$(find "$PROFILE_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    [ -d "$ICON_DIR" ] && icons="$(find "$ICON_DIR" -name 'multicodex-*.icns' 2>/dev/null | wc -l | tr -d ' ')"
+    ok "$n profile(s), $icons/10 colour icons"
+    [ -d / ] && case "$(diskutil info / 2>/dev/null | sed -n 's/.*File System Personality: *//p')" in
+        *APFS*) ok "APFS — profile clones are copy-on-write" ;;
+        *) warn "not APFS — each profile will use full disk space" ;;
+    esac
+}
+
+usage() {
+    cat <<USAGE
+multicodex $VERSION — several ChatGPT/Codex accounts on one Mac
+
+  multicodex install                    download and install the latest ChatGPT
+  multicodex create <name> [--color c]  create a profile with its own app
+  multicodex launch <name>              launch a profile
+  multicodex launch --all               launch every profile
+  multicodex list                       list profiles and their state
+  multicodex sync [name]                rebuild profiles after a ChatGPT update
+  multicodex remove <name>              delete a profile
+  multicodex colors                     show available colours
+  multicodex doctor                     check the installation
+
+Every profile is a copy-on-write clone of the official app with its own name,
+colour, bundle id and signature, so macOS treats it as a separate application
+with its own Dock tile and privacy grants. Accounts are isolated through
+CODEX_HOME. Run 'multicodex sync' after ChatGPT updates.
+USAGE
+}
+
+main() {
+    [ $# -ge 1 ] || { usage; exit 1; }
+    local cmd="$1"; shift
+    case "$cmd" in
+        install) cmd_install "$@" ;;
+        create)  cmd_create "$@" ;;
+        launch)
+            if [ "${1:-}" = "--all" ] || [ "${1:-}" = "-a" ]; then cmd_launch_all
+            else cmd_launch "$@"; fi ;;
+        open-all|openall) cmd_launch_all ;;
+        sync)    cmd_sync "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        remove|rm) cmd_remove "$@" ;;
+        colors|colours) cmd_colors "$@" ;;
+        doctor)  cmd_doctor "$@" ;;
+        -h|--help|help) usage ;;
+        --version) printf 'multicodex %s\n' "$VERSION" ;;
+        *) die "unknown command '$cmd' (try: multicodex help)" ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

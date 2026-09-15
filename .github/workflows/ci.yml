@@ -1,0 +1,24 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: command -v shellcheck || brew install shellcheck
+      - name: Check Bash syntax and lint
+        run: |
+          bash -n bin/multicodex
+          shellcheck bin/multicodex
+      - name: Run regression tests
+        run: python3 -m unittest discover -s tests -v
