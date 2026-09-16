@@ -234,9 +234,9 @@ build_profile_app() {
 #!/bin/bash
 set -eu
 here="\$(cd -- "\$(dirname -- "\$0")" && pwd)"
-bundle="\$(cd -- "\$here/../.." && pwd)"
-profile="\$(basename "\$bundle" .app)"
-profile="\${profile#Codex }"
+# The profile name is fixed at build time. Deriving it from the bundle name
+# would silently open a different, empty profile if the app were ever renamed.
+profile="$name"
 
 home="\${MULTICODEX_ROOT:-\$HOME/.multicodex/profiles}/\$profile"
 data="\$HOME/Library/Application Support/MultiCodex/\$profile"
