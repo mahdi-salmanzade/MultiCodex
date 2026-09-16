@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -21,7 +22,12 @@ app_build() { printf '%s\n' "${TEST_BUILD:-10}"; }
 refresh_icon_cache() { :; }
 build_profile_app() {
     printf '%s\n' "$1" >> "$TEST_DIR/builds"
-    mkdir -p "$(profile_app "$1")"
+    mkdir -p "$(profile_app "$1")/Contents/MacOS"
+    # The real build installs a launcher as the bundle's main executable, and
+    # cmd_sync treats a bundle without one as stale. Mirror that here so the
+    # stub keeps the contract sync relies on.
+    : > "$(profile_app "$1")/Contents/MacOS/$LAUNCHER_NAME"
+    chmod +x "$(profile_app "$1")/Contents/MacOS/$LAUNCHER_NAME"
     info "mock build progress"
     printf '%s\n' "$(profile_app "$1")"
 }
@@ -65,7 +71,7 @@ class CLIBehavior(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("multicodex sync", result.stdout)
         result = subprocess.run([str(CLI), "--version"], capture_output=True, text=True)
-        self.assertEqual(result.stdout.strip(), "multicodex 1.0.0")
+        self.assertEqual(result.stdout.strip(), "multicodex 1.0.1")
 
     def test_create_metadata_and_private_directories(self):
         result = self.create()
@@ -235,10 +241,30 @@ main launch --all
         self.assertIn("work already running", result.stdout)
         self.assertIn("1 started, 0 failed", result.stdout)
 
+    def test_sync_rebuilds_a_bundle_without_a_launcher(self):
+        # Profiles built before the launcher existed open the shared default
+        # data directory, hand off to whichever instance already owns it and
+        # exit. Sync must treat them as stale even when the version matches.
+        self.create()
+        launcher = self.root / "apps/Codex work.app/Contents/MacOS" / "multicodex-launcher"
+        launcher.unlink()
+        self.run_shell("cmd_sync work")
+        self.assertEqual((self.root / "builds").read_text().splitlines(), ["work", "work"])
+        self.assertTrue(launcher.exists())
+
+    def test_sync_force_rebuilds_an_up_to_date_profile(self):
+        self.create()
+        self.run_shell("cmd_sync work")
+        self.assertEqual((self.root / "builds").read_text().splitlines(), ["work"])
+        self.run_shell("cmd_sync --force work")
+        self.assertEqual((self.root / "builds").read_text().splitlines(), ["work", "work"])
+
     def test_launch_all_reports_failure_and_continues(self):
         self.create("broken", "red")
         self.create("work", "blue")
-        (self.root / "apps/Codex broken.app").rmdir()
+        # The bundle now holds a launcher, so remove the tree rather than the
+        # bare directory.
+        shutil.rmtree(self.root / "apps/Codex broken.app")
         result = self.run_shell(r'''
 profile_running() { [ -f "$TEST_DIR/started-$1" ]; }
 open() { touch "$TEST_DIR/started-work"; }

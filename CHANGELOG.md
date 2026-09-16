@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix profiles failing to open from Finder, Spotlight, or the Dock once any other instance was running. Electron takes its data directory only from `--user-data-dir`, which those launches cannot pass, so a profile fell back to the shared default directory, reported `Opening in existing browser session.` and exited. Each profile app now carries a launcher as its main executable that supplies its own settings however it is started.
+- Fix most profiles exiting when several were launched in quick succession, which had the same cause.
+- Treat a profile application without that launcher as stale so existing profiles are rebuilt on the next sync, and add `sync --force` to rebuild regardless of version.
+
 - Add opt-in two-way conversation sharing with `sessions sync/enable/disable/status`, including paginated message history and a 15-second macOS LaunchAgent.
 - Back up conversation databases before sharing, retain separate account state, and report schema mismatches and sync failures.
 - Restore moved session paths with `repair <name> [--from /old/profile/home]`.

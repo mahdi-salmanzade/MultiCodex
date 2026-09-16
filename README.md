@@ -105,7 +105,13 @@ multicodex launch --all
 
 Profiles start in sequence to avoid competing during startup. Already running profiles are skipped; each new app is given up to 30 seconds to appear as a running process. This checks process startup, not successful sign-in.
 
-**Launch profiles with `multicodex launch <name>`.** This supplies the environment variables that isolate their data. Opening a profile directly from Finder, Spotlight, or a pinned Dock icon does not supply those settings and can open the default account instead. Once launched, use the Dock or Cmd-Tab to switch between running windows.
+**Launch a profile however you like.** `multicodex launch <name>`, Finder, Spotlight, or a pinned Dock icon all work: each profile app carries its own isolation settings internally, so it opens its own account whichever way it is started. Once launched, use the Dock or Cmd-Tab to switch between running windows.
+
+Profiles created before 1.0.1 predate that launcher. Rebuild them once so Dock and Spotlight launches work:
+
+```sh
+multicodex sync --force
+```
 
 ```sh
 multicodex list

@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 readonly APP="${MULTICODEX_APP:-/Applications/ChatGPT.app}"
 readonly DOWNLOAD_URL="https://persistent.oaistatic.com/sidekick/public/ChatGPT.dmg"
 readonly OPENAI_TEAM_ID="2DC432GLL2"
@@ -29,6 +29,7 @@ SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ICON_DIR="${MULTICODEX_ICONS:-$SELF/assets/icons}"
 
 readonly COLORS="blue green purple orange red teal pink yellow indigo graphite"
+readonly LAUNCHER_NAME="multicodex-launcher"
 readonly LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 # ---------------------------------------------------------------- output
@@ -218,6 +219,38 @@ build_profile_app() {
         warn "icon for '$color' missing — run: python3 tools/make_icons.py"
     fi
 
+    # Install a launcher as the bundle's main executable so the app carries its
+    # own isolation settings. Electron takes its data directory only from
+    # --user-data-dir, and a Finder, Dock or Spotlight launch cannot pass
+    # arguments. Without this the app falls back to the shared default directory,
+    # finds the session another instance already owns, prints "Opening in
+    # existing browser session." and exits — so profiles appear not to open at
+    # all once any other instance is running.
+    local macos real
+    macos="$target/Contents/MacOS"
+    real="$(defaults read "$plist" CFBundleExecutable 2>/dev/null || echo ChatGPT)"
+    if [ "$real" != "$LAUNCHER_NAME" ] && [ -x "$macos/$real" ]; then
+        cat > "$macos/$LAUNCHER_NAME" <<LAUNCHER
+#!/bin/bash
+set -eu
+here="\$(cd -- "\$(dirname -- "\$0")" && pwd)"
+bundle="\$(cd -- "\$here/../.." && pwd)"
+profile="\$(basename "\$bundle" .app)"
+profile="\${profile#Codex }"
+
+home="\${MULTICODEX_ROOT:-\$HOME/.multicodex/profiles}/\$profile"
+data="\$HOME/Library/Application Support/MultiCodex/\$profile"
+mkdir -p -m 700 "\$home" "\$data" 2>/dev/null || true
+
+export CODEX_HOME="\$home"
+export CODEX_ELECTRON_USER_DATA_PATH="\$data"
+exec "\$here/$real" --user-data-dir="\$data" "\$@"
+LAUNCHER
+        chmod +x "$macos/$LAUNCHER_NAME"
+        /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $LAUNCHER_NAME" "$plist" >/dev/null 2>&1 || true
+        ok "self-contained launcher installed"
+    fi
+
     info "re-signing as '$identity'"
     codesign --force --deep --sign "$identity" "$target" >/dev/null 2>&1 \
         || die "codesign failed for $target"
@@ -268,7 +301,18 @@ cmd_create() {
 }
 
 cmd_sync() {
-    [ $# -le 1 ] || die "usage: multicodex sync [name]"
+    local force="false"
+    local args=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force|-f) force="true"; shift ;;
+            -*) die "unknown option: $1" ;;
+            *) args="$args $1"; shift ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    set -- $args
+    [ $# -le 1 ] || die "usage: multicodex sync [--force] [name]"
     if [ $# -eq 1 ]; then valid_name "$1" || die "invalid name '$1'"; fi
     require_app
     local current current_build targets name
@@ -297,7 +341,11 @@ cmd_sync() {
             color="$(next_color)"
             printf 'color=%s\n' "$color" > "$(meta_file "$name")"
         fi
-        if [ "$was" = "$current" ] && [ "$(meta_get "$name" source_build)" = "$current_build" ] && [ -d "$(profile_app "$name")" ]; then
+        if [ "$force" = "false" ] \
+            && [ "$was" = "$current" ] \
+            && [ "$(meta_get "$name" source_build)" = "$current_build" ] \
+            && [ -d "$(profile_app "$name")" ] \
+            && [ -x "$(profile_app "$name")/Contents/MacOS/$LAUNCHER_NAME" ]; then
             ok "$name already on $current"
             continue
         fi
@@ -555,7 +603,7 @@ multicodex $VERSION — several ChatGPT/Codex accounts on one Mac
   multicodex launch <name>              launch a profile
   multicodex launch --all               launch every profile
   multicodex list                       list profiles and their state
-  multicodex sync [name]                rebuild profiles after a ChatGPT update
+  multicodex sync [--force] [name]      rebuild profiles after a ChatGPT update
   multicodex repair <name> [--from path] restore access after moving a profile
   multicodex sessions sync <name>       sync chats both ways with default Codex
   multicodex sessions enable <name>     keep chats synced every 15 seconds
