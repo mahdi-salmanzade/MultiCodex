@@ -25,7 +25,20 @@ readonly PROFILE_ROOT="${MULTICODEX_ROOT:-$HOME/.multicodex/profiles}"
 readonly DATA_ROOT="$HOME/Library/Application Support/MultiCodex"
 readonly APP_DIR="$HOME/Applications"
 
-SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# The documented install links this script into ~/.local/bin, and BASH_SOURCE
+# reports the link's own path, so the repository holding the icons is only
+# reachable by following the link back first.
+resolve_self() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir="$(cd -- "$(dirname -- "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+    done
+    cd -- "$(dirname -- "$src")/.." && pwd
+}
+
+SELF="$(resolve_self)"
 readonly ICON_DIR="${MULTICODEX_ICONS:-$SELF/assets/icons}"
 
 readonly COLORS="blue green purple orange red teal pink yellow indigo graphite"

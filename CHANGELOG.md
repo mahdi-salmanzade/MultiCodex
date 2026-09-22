@@ -4,6 +4,7 @@
 
 - Stop profiles from capturing `codex://` links system-wide. Every clone inherited the official app's claim on `codex:`, `http:` and `https:`, and macOS binds one handler per scheme, so the most recently launched profile silently took every deep link — an MCP login could complete in a different profile than the one that started it. Each profile now declares only `codex-<name>:` and leaves the shared schemes to the official app.
 - Report which application holds `codex:` in `doctor`.
+- Find the bundled icons when the script is run through the `~/.local/bin` symlink the install instructions create. `BASH_SOURCE` reports the link rather than its target, so every sync from that path silently rebuilt profiles with the stock icon.
 - Refuse to rebuild a profile whose application is running, instead of replacing the bundle underneath it; `sync` reports it and continues with the rest.
 
 - Fix profiles failing to open from Finder, Spotlight, or the Dock once any other instance was running. Electron takes its data directory only from `--user-data-dir`, which those launches cannot pass, so a profile fell back to the shared default directory, reported `Opening in existing browser session.` and exited. Each profile app now carries a launcher as its main executable that supplies its own settings however it is started.

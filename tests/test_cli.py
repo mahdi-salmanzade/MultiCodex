@@ -393,5 +393,23 @@ class URLSchemeNamespacing(unittest.TestCase):
         self.assertEqual(types[0]["CFBundleURLSchemes"], ["codex-my-work"])
 
 
+class AssetLookup(unittest.TestCase):
+    def test_assets_resolve_through_an_installed_symlink(self):
+        # The documented install links the script into ~/.local/bin. BASH_SOURCE
+        # reports the link, not its target, so the icons live one resolution away.
+        with tempfile.TemporaryDirectory(prefix="multicodex-link-") as temp:
+            link = Path(temp) / "multicodex"
+            link.symlink_to(CLI)
+            result = subprocess.run(
+                ["/bin/bash", "-c", f'source "{link}"\nprintf "%s\\n" "$SELF" "$ICON_DIR"'],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self_dir, icon_dir = result.stdout.split()
+            self.assertEqual(Path(self_dir), REPO)
+            self.assertTrue(Path(icon_dir).is_dir(), icon_dir)
+
+
 if __name__ == "__main__":
     unittest.main()
