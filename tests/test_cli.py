@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import sqlite3
 import subprocess
@@ -342,6 +343,54 @@ verify_openai_bundle "$APP"
                 self.env[variable] = value
                 self.run_shell(mock, success=False)
                 del self.env[variable]
+
+
+class URLSchemeNamespacing(unittest.TestCase):
+    """A clone must not claim the schemes the official app answers on."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="multicodex-plist-")
+        self.addCleanup(self.temp.cleanup)
+        self.plist = Path(self.temp.name) / "Info.plist"
+
+    def write(self, url_types):
+        with open(self.plist, "wb") as handle:
+            plistlib.dump({"CFBundleURLTypes": url_types}, handle)
+
+    def namespace(self, name):
+        result = subprocess.run(
+            ["/bin/bash", "-c",
+             f'source "{CLI}"\nnamespace_url_schemes "{self.plist}" "{name}"'],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with open(self.plist, "rb") as handle:
+            return plistlib.load(handle)["CFBundleURLTypes"]
+
+    def test_private_scheme_replaces_the_shared_ones(self):
+        # The shape the official app ships: one entry claiming codex and the web.
+        self.write([{"CFBundleURLName": "ChatGPT",
+                     "CFBundleURLSchemes": ["codex", "http", "https"]}])
+        types = self.namespace("work")
+        self.assertEqual(len(types), 1)
+        self.assertEqual(types[0]["CFBundleURLSchemes"], ["codex-work"])
+        self.assertEqual(types[0]["CFBundleURLName"], "local.multicodex.work")
+
+    def test_web_only_entries_are_dropped(self):
+        self.write([
+            {"CFBundleURLName": "ChatGPT", "CFBundleURLSchemes": ["http", "HTTPS"]},
+            {"CFBundleURLName": "ChatGPT", "CFBundleURLSchemes": ["codex", "chatgpt"]},
+        ])
+        types = self.namespace("work")
+        self.assertEqual(len(types), 1)
+        self.assertEqual(types[0]["CFBundleURLSchemes"], ["codex-work", "chatgpt-work"])
+
+    def test_names_are_folded_into_a_valid_scheme(self):
+        # Profile names admit '_' and capitals; URL schemes admit neither.
+        self.write([{"CFBundleURLName": "ChatGPT", "CFBundleURLSchemes": ["codex"]}])
+        types = self.namespace("My_Work")
+        self.assertEqual(types[0]["CFBundleURLSchemes"], ["codex-my-work"])
 
 
 if __name__ == "__main__":

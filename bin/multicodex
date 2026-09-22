@@ -55,6 +55,25 @@ valid_color() {
     return 1
 }
 
+# URL schemes are case-insensitive and may hold only letters, digits, '+', '-'
+# and '.', so a profile name has to be folded before it can become one.
+scheme_suffix() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.+-]/-/g'
+}
+
+# The application LaunchServices hands a given URL scheme to, when the user
+# database records an explicit binding. Empty means no override is stored and
+# the scheme falls to whichever app declares it.
+default_url_handler() {
+    defaults read com.apple.LaunchServices/com.apple.launchservices.secure 2>/dev/null | awk -v want="$1" '
+        /LSHandlerRoleAll/ { role = $0; sub(/^[^=]*= */, "", role); gsub(/[";]/, "", role) }
+        /LSHandlerURLScheme/ {
+            scheme = $0; sub(/^[^=]*= */, "", scheme); gsub(/[";]/, "", scheme)
+            if (scheme == want && role != "-") { print role; exit }
+        }
+    '
+}
+
 codex_home()  { printf '%s/%s\n' "$PROFILE_ROOT" "$1"; }
 legacy_codex_home() { printf '%s/.codex-profiles/%s\n' "$HOME" "$1"; }
 data_dir()    { printf '%s/%s\n' "$DATA_ROOT" "$1"; }
@@ -183,10 +202,68 @@ cmd_install() {
 
 # ---------------------------------------------------------------- build
 
+# Every clone inherits CFBundleURLTypes from the official app, so each one
+# claims `codex:` — and `http:`/`https:` with it. LaunchServices binds a single
+# handler per scheme, and the app re-claims `codex:` as it starts, so the most
+# recently launched clone silently captures every codex:// link on the system.
+# The OAuth callback that completes an MCP login is such a link, which is how a
+# login started in one profile ends up opening another. Each clone therefore
+# keeps only a scheme of its own, and the shared ones are left to the official
+# app.
+namespace_url_schemes() {
+    local plist="$1" name="$2" suffix i j scheme schemes url_name emptied=""
+    suffix="$(scheme_suffix "$name")"
+
+    i=0
+    while /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes:$i" "$plist" >/dev/null 2>&1; do
+        schemes=""
+        j=0
+        while scheme="$(/usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes:$i:CFBundleURLSchemes:$j" "$plist" 2>/dev/null)"; do
+            case "$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')" in
+                http|https) ;;
+                *) schemes="$schemes $scheme-$suffix" ;;
+            esac
+            j=$((j + 1))
+        done
+
+        /usr/libexec/PlistBuddy -c "Delete :CFBundleURLTypes:$i:CFBundleURLSchemes" "$plist" >/dev/null 2>&1 || true
+        if [ -n "${schemes// /}" ]; then
+            /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:$i:CFBundleURLSchemes array" "$plist" >/dev/null 2>&1 || true
+            j=0
+            for scheme in $schemes; do
+                /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:$i:CFBundleURLSchemes:$j string $scheme" "$plist" >/dev/null 2>&1 || true
+                j=$((j + 1))
+            done
+            url_name="local.multicodex.$name"
+            [ "$i" -eq 0 ] || url_name="$url_name.$i"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleURLTypes:$i:CFBundleURLName $url_name" "$plist" >/dev/null 2>&1 \
+                || /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:$i:CFBundleURLName string $url_name" "$plist" >/dev/null 2>&1 || true
+        else
+            # Nothing but web schemes here. Drop the entry once the walk is done,
+            # highest index first, so the indices ahead of it stay valid.
+            emptied="$i $emptied"
+        fi
+        i=$((i + 1))
+    done
+
+    for j in $emptied; do
+        /usr/libexec/PlistBuddy -c "Delete :CFBundleURLTypes:$j" "$plist" >/dev/null 2>&1 || true
+    done
+
+    ok "url scheme: codex-$suffix: (codex: stays with the official app)"
+}
+
 # Clone, rebrand and re-sign one profile application.
 build_profile_app() {
     local name="$1" color="$2" target
     target="$(profile_app "$name")"
+
+    # Building replaces the bundle on disk, and a running profile still reads
+    # resources out of it. Refuse rather than pull them out from under it.
+    if profile_running "$name"; then
+        warn "profile '$name' is running — quit Codex $name, then run sync again"
+        return 1
+    fi
 
     local identity
     identity="$(signing_identity)"
@@ -202,6 +279,7 @@ build_profile_app() {
     /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Codex $name" "$plist" >/dev/null 2>&1 \
         || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Codex $name" "$plist" >/dev/null 2>&1 || true
     /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier local.multicodex.$name" "$plist" >/dev/null 2>&1 || true
+    namespace_url_schemes "$plist" "$name"
 
     local icon_src icon_name
     icon_src="$ICON_DIR/multicodex-$color.icns"
@@ -350,7 +428,10 @@ cmd_sync() {
             continue
         fi
         printf '\n'; bold "  $name ($was -> $current)"
-        build_profile_app "$name" "$color" >/dev/null
+        if ! build_profile_app "$name" "$color" >/dev/null; then
+            warn "$name not updated"
+            continue
+        fi
         printf 'color=%s\nsource_version=%s\nsource_build=%s\n' "$color" "$current" "$current_build" > "$(meta_file "$name")"
         ok "$name updated"
     done
@@ -575,6 +656,14 @@ cmd_doctor() {
         fi
     else
         warn "ChatGPT not installed — run: multicodex install"
+    fi
+
+    local handler; handler="$(default_url_handler codex)"
+    if [ -z "$handler" ] || [ "$handler" = "$OPENAI_BUNDLE_ID" ]; then
+        ok "codex: links open the official app"
+    else
+        warn "codex: links open '$handler' — deep links and MCP logins land in that profile"
+        warn "run 'multicodex sync --force' to stop profiles claiming the shared scheme"
     fi
 
     local identity; identity="$(signing_identity)"

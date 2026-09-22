@@ -228,8 +228,11 @@ Re-signing is necessary because changing app metadata invalidates the original s
 1. Clone the installed official application, using APFS copy-on-write when available.
 2. Set the profile's display name, bundle identifier (`local.multicodex.<name>`), and colored icon.
 3. Remove `CFBundleIconName` so the app's asset catalog does not override the replacement `.icns`.
-4. Re-sign and verify the copy, then register it with Launch Services.
-5. Launch with `CODEX_HOME`, `CODEX_ELECTRON_USER_DATA_PATH`, and `--user-data-dir` pointing at the profile's directories.
+4. Give the copy a URL scheme of its own (`codex-<name>:`) and drop its claim on `codex:`, `http:` and `https:`.
+5. Re-sign and verify the copy, then register it with Launch Services.
+6. Launch with `CODEX_HOME`, `CODEX_ELECTRON_USER_DATA_PATH`, and `--user-data-dir` pointing at the profile's directories.
+
+Step 4 matters more than it looks. macOS binds one application to each URL scheme, and the app claims `codex:` as it starts. A clone that inherited that claim would take every `codex://` link on the machine the moment it was launched — including the OAuth callback that finishes an MCP login, which would then open in whichever profile ran most recently rather than the one that began the login. Giving each profile a private scheme leaves `codex:` with the official app. `multicodex doctor` reports which application currently holds it.
 
 Both environment variables matter. In the app behavior this tool was developed against, setting only `CODEX_HOME` can be overridden by the app's login-shell environment loading. The Electron data path keeps the profile configuration separate.
 
