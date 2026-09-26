@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix `install` downloading the wrong application. The old download link now serves the separate ChatGPT chat app (`com.openai.chat`), which the bundle identifier check rejected, so a fresh install could not succeed. `install` now downloads Codex from `codex-app-prod/Codex.dmg`, the link the Codex app itself uses.
+
 - Stop profiles from capturing `codex://` links system-wide. Every clone inherited the official app's claim on `codex:`, `http:` and `https:`, and macOS binds one handler per scheme, so the most recently launched profile silently took every deep link — an MCP login could complete in a different profile than the one that started it. Each profile now declares only `codex-<name>:` and leaves the shared schemes to the official app.
 - Report which application holds `codex:` in `doctor`.
 - Find the bundled icons when the script is run through the `~/.local/bin` symlink the install instructions create. `BASH_SOURCE` reports the link rather than its target, so every sync from that path silently rebuilt profiles with the stock icon.

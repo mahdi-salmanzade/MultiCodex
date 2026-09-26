@@ -17,7 +17,7 @@ set -euo pipefail
 
 readonly VERSION="1.0.1"
 readonly APP="${MULTICODEX_APP:-/Applications/ChatGPT.app}"
-readonly DOWNLOAD_URL="https://persistent.oaistatic.com/sidekick/public/ChatGPT.dmg"
+readonly DOWNLOAD_URL="https://persistent.oaistatic.com/codex-app-prod/Codex.dmg"
 readonly OPENAI_TEAM_ID="2DC432GLL2"
 readonly OPENAI_BUNDLE_ID="com.openai.codex"
 
