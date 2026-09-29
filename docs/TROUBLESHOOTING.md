@@ -65,7 +65,7 @@ multicodex sessions enable work
 multicodex sessions status work
 ```
 
-Use the same `--with <peer>` argument for `sync`, `enable`, `status`, and `disable` when sharing two named profiles. The first run creates SQLite backups before merging. The agent repeats every 15 seconds while logged in and runs at login. macOS may delay background work or suspend it during sleep. `status` shows the last successful pass and the latest error, if any; its output includes the backup/log directory. Reopen Codex once if the imported chats are not visible in a cached sidebar.
+Use the same `--with <peer>` argument for `sync`, `enable`, `status`, and `disable` when sharing two named profiles. The first run creates SQLite backups before merging. The agent repeats every 15 seconds while logged in and runs at login. macOS may delay background work or suspend it during sleep. `status` shows the last successful pass and the latest error, if any; its output includes the backup/log directory. Projects and the chats filed under them reach an app only while it is closed: quit it, wait about 15 seconds (or run `multicodex sessions sync work`), then reopen it. If `status` shows `sidebar_waiting_for_quit`, the listed app is still open.
 
 The sync helper requires Python 3 and the repository's `tools/session_sync.py`. Keep the checkout and Python installation in place. If either moves, run `enable` again from the new checkout. If the two apps use different database schemas, sync stops before importing; update both apps, then rerun it. The integration uses Codex's local SQLite schema and may need an update after a Codex release.
 

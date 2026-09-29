@@ -178,6 +178,181 @@ def merge_history(left, right):
     return changed
 
 
+# The sidebar's projects and thread-to-project assignments live in the desktop
+# app's own state file, not the SQLite databases: each app lists only the
+# projects in its `local-projects`, under IDs private to that app. The app reads
+# the file once at launch and rewrites it whole on every change, so a copy is
+# written only while that app is closed and takes effect when it next opens.
+GLOBAL_STATE = ".codex-global-state.json"
+PROJECTS, ORDER = "local-projects", "project-order"
+ASSIGNMENTS, PROJECTLESS = "thread-project-assignments", "projectless-thread-ids"
+PINNED_PROJECTS = "pinned-project-ids"
+DEFAULT_HOME = Path.home() / ".codex"
+
+
+def app_running(home):
+    # macOS hides these processes' environment, so identify each app by its
+    # arguments: profiles are launched with their own --user-data-dir, the
+    # official app with none.
+    result = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True)
+    if result.returncode:
+        return True
+    marker = "/Contents/MacOS/ChatGPT"
+    default = home.resolve() == DEFAULT_HOME.resolve()
+    for command in result.stdout.splitlines():
+        if marker not in command:
+            continue
+        head, _, args = command.partition(marker)
+        if args and not args.startswith(" "):
+            continue
+        data = [a for a in args.split(" --") if a.startswith("user-data-dir=")]
+        if default and not data:
+            return True
+        if not default and any(Path(a.split("=", 1)[1].strip()).name == home.name for a in data):
+            return True
+    return False
+
+
+def project_key(project):
+    return json.dumps(sorted(os.path.realpath(p) for p in project.get("rootPaths") or []))
+
+
+def sidebar(state):
+    """Reduce an app's state to ID-free items: projects by root folders, and
+    each thread's project (by the same key) or "" when explicitly projectless."""
+    projects = state.get(PROJECTS) or {}
+    keys = {pid: project_key(p) for pid, p in projects.items() if p.get("rootPaths")}
+    items = {}
+    for pid, key in keys.items():
+        items.setdefault("project:" + key, projects[pid].get("name", ""))
+    for thread in state.get(PROJECTLESS) or []:
+        items["thread:" + thread] = ""
+    for thread, target in (state.get(ASSIGNMENTS) or {}).items():
+        if target.get("projectKind") == "local" and target.get("projectId") in keys:
+            items["thread:" + thread] = keys[target["projectId"]]
+    return items
+
+
+def project_timestamp(state, key):
+    return max([p.get("updatedAt") or 0 for p in (state.get(PROJECTS) or {}).values()
+                if p.get("rootPaths") and project_key(p) == key] or [0])
+
+
+def apply_sidebar(state, merged, peer):
+    """Rewrite this app's sidebar keys to match the merged items, keeping its
+    own project IDs and every key this tool does not manage."""
+    projects = dict(state.get(PROJECTS) or {})
+    ids = {}
+    for pid, project in projects.items():
+        if project.get("rootPaths"):
+            ids.setdefault(project_key(project), pid)
+    peer_projects = {project_key(p): p for p in (peer.get(PROJECTS) or {}).values() if p.get("rootPaths")}
+    wanted = {k[8:]: v for k, v in merged.items() if k.startswith("project:")}
+    for pid, project in list(projects.items()):
+        key = project_key(project) if project.get("rootPaths") else None
+        if key is not None and key not in wanted:
+            del projects[pid]
+        elif key is not None and ids.get(key) == pid and project.get("name") != wanted[key]:
+            projects[pid] = dict(project, name=wanted[key])
+    ids = {k: v for k, v in ids.items() if k in wanted}
+    added = []
+    for key in sorted(wanted.keys() - ids.keys()):
+        source = peer_projects.get(key) or {"rootPaths": json.loads(key), "createdAt": 0, "updatedAt": 0}
+        pid = source.get("id") if source.get("id") and source.get("id") not in projects else None
+        pid = pid or "local-" + hashlib.sha256(key.encode()).hexdigest()[:32]
+        projects[pid] = dict(source, id=pid, name=wanted[key])
+        ids[key] = pid
+        added.append(pid)
+    order = [p for p in state.get(ORDER) or [] if p in projects]
+    peer_order = [project_key((peer.get(PROJECTS) or {}).get(p) or {}) for p in peer.get(ORDER) or []]
+    rank = {ids[k]: i for i, k in enumerate(peer_order) if k in ids}
+    order += sorted((p for p in added if p not in order), key=lambda p: rank.get(p, len(rank)))
+    order += [p for p in projects if p not in order]
+    assignments = {t: v for t, v in (state.get(ASSIGNMENTS) or {}).items()
+                   if not (v.get("projectKind") == "local" and v.get("projectId") not in projects)}
+    projectless = list(state.get(PROJECTLESS) or [])
+    for item in sidebar(state).keys() - merged.keys():
+        if item.startswith("thread:"):
+            assignments.pop(item[7:], None)
+            projectless = [t for t in projectless if t != item[7:]]
+    for item, value in merged.items():
+        if not item.startswith("thread:"):
+            continue
+        thread = item[7:]
+        if value:
+            assignments[thread] = {"projectKind": "local", "projectId": ids[value]}
+            if thread in projectless:
+                projectless.remove(thread)
+        else:
+            if assignments.get(thread, {}).get("projectKind") == "local":
+                del assignments[thread]
+            if thread not in projectless:
+                projectless.append(thread)
+    result = dict(state)
+    result[PROJECTS], result[ORDER], result[ASSIGNMENTS] = projects, order, assignments
+    result[PROJECTLESS] = projectless
+    if PINNED_PROJECTS in result:
+        result[PINNED_PROJECTS] = [p for p in result[PINNED_PROJECTS] if p in projects]
+    return result
+
+
+def merge_sidebar(left_home, right_home, folder):
+    paths = [home / GLOBAL_STATE for home in (left_home, right_home)]
+    if not all(p.is_file() for p in paths):
+        return 0, []
+    states = [json.loads(p.read_text()) for p in paths]
+    views = [sidebar(s) for s in states]
+    baseline_path = folder / "sidebar-baseline.json"
+    baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else {}
+    merged = {}
+    for item in sorted(views[0].keys() | views[1].keys()):
+        a, b = views[0].get(item), views[1].get(item)
+        old = baseline.get(item)
+        if a == b:
+            winner = a
+        elif a is None or b is None:
+            present = b if a is None else a
+            # Missing where it existed at the last complete merge: removed there.
+            winner = None if old is not None and old == present else present
+        elif old == a:
+            winner = b
+        elif old == b:
+            winner = a
+        elif item.startswith("project:"):
+            key = item[8:]
+            winner = b if project_timestamp(states[1], key) > project_timestamp(states[0], key) else a
+        else:
+            winner = a
+        if winner is not None:
+            merged[item] = winner
+    # A thread may only point at a project that survived the merge.
+    merged = {k: v for k, v in merged.items()
+              if not (k.startswith("thread:") and v and "project:" + v not in merged)}
+    writes, pending = 0, []
+    for index, (home, path) in enumerate(zip((left_home, right_home), paths)):
+        if views[index] == merged:
+            continue
+        if app_running(home):
+            pending.append(str(home))
+            continue
+        backup = folder / "backup" / f"{index}-{GLOBAL_STATE.lstrip('.')}"
+        if not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            backup.write_bytes(path.read_bytes())
+            backup.chmod(0o600)
+        updated = apply_sidebar(states[index], merged, states[1 - index])
+        temp = path.with_name(path.name + ".multicodex-tmp")
+        temp.write_text(json.dumps(updated, separators=(",", ":")))
+        temp.chmod(path.stat().st_mode & 0o777)
+        temp.replace(path)
+        writes += 1
+    # Advance the baseline only once both apps hold the merged sidebar, so a
+    # side that was open keeps receiving what it missed.
+    if not pending:
+        write_json(baseline_path, merged)
+    return writes, pending
+
+
 def backup_databases(paths, folder):
     complete = folder / "complete.json"
     if complete.exists():
@@ -211,9 +386,12 @@ def sync_once(left_home, right_home, folder):
         history = merge_history(lh, rh)
         baseline, changes, conflicts = merge_state(left, right, baseline)
         write_json(baseline_path, baseline)
+        sidebar_writes, sidebar_pending = merge_sidebar(left_home, right_home, folder)
         result = {"last_success": datetime.now(timezone.utc).isoformat(),
                   "metadata_writes": changes, "history_threads": history,
-                  "conflicts_resolved": conflicts, "left": str(left_home), "right": str(right_home)}
+                  "conflicts_resolved": conflicts, "sidebar_writes": sidebar_writes,
+                  "sidebar_waiting_for_quit": sidebar_pending,
+                  "left": str(left_home), "right": str(right_home)}
         write_json(folder / "status.json", result)
         print(json.dumps(result), flush=True)
         return result

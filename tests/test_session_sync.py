@@ -3,10 +3,12 @@
 import importlib.util
 import contextlib
 import io
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location(
     "session_sync", Path(__file__).resolve().parents[1] / "tools/session_sync.py")
@@ -152,6 +154,78 @@ class SessionSync(unittest.TestCase):
         result = self.run_sync()
         self.assertEqual(result["conflicts_resolved"], 1)
         self.assertEqual(self.rows(self.homes[0], "threads")[0][2], "work")
+
+    def write_sidebar(self, home, projects, assignments=(), projectless=()):
+        state = {"other-setting": home.name,
+                 "local-projects": {pid: {"id": pid, "name": name, "rootPaths": [root],
+                                          "createdAt": 1, "updatedAt": 1}
+                                    for pid, name, root in projects},
+                 "project-order": [pid for pid, _, _ in projects],
+                 "thread-project-assignments": {t: {"projectKind": "local", "projectId": p}
+                                                for t, p in assignments},
+                 "projectless-thread-ids": list(projectless)}
+        (home / sync.GLOBAL_STATE).write_text(json.dumps(state))
+
+    def read_sidebar(self, home):
+        return json.loads((home / sync.GLOBAL_STATE).read_text())
+
+    def sidebar_sync(self, running=()):
+        with mock.patch.object(sync, "app_running", lambda home: home.name in running):
+            return self.run_sync()
+
+    def test_sidebar_projects_match_by_folder_across_different_ids(self):
+        self.write_sidebar(self.homes[0], [("local-a", "Shared", "/tmp/shared"),
+                                           ("local-b", "Only default", "/tmp/default")],
+                           [("t1", "local-a"), ("t2", "local-b")], ["t3"])
+        self.write_sidebar(self.homes[1], [("uuid-a", "Shared", "/tmp/shared"),
+                                           ("uuid-c", "Only work", "/tmp/work")],
+                           [("t4", "uuid-a"), ("t5", "uuid-c")])
+        result = self.sidebar_sync()
+        self.assertEqual(result["sidebar_writes"], 2)
+        views = [sync.sidebar(self.read_sidebar(h)) for h in self.homes]
+        self.assertEqual(views[0], views[1])
+        work = self.read_sidebar(self.homes[1])
+        self.assertEqual(len(work["local-projects"]), 3)
+        self.assertEqual(work["thread-project-assignments"]["t1"]["projectId"], "uuid-a")
+        self.assertEqual(work["project-order"][:2], ["uuid-a", "uuid-c"])
+        self.assertEqual(work["projectless-thread-ids"], ["t3"])
+        self.assertEqual(work["other-setting"], "work")
+        self.assertTrue((self.folder / "backup/1-codex-global-state.json").is_file())
+        self.assertEqual(self.sidebar_sync()["sidebar_writes"], 0)
+
+    def test_sidebar_waits_for_an_open_app_and_catches_up_after_it_quits(self):
+        self.write_sidebar(self.homes[0], [("local-a", "A", "/tmp/a")], [("t1", "local-a")])
+        self.write_sidebar(self.homes[1], [])
+        result = self.sidebar_sync(running={"work"})
+        self.assertEqual(result["sidebar_waiting_for_quit"], [str(self.homes[1])])
+        self.assertEqual(self.read_sidebar(self.homes[1])["local-projects"], {})
+        self.assertFalse((self.folder / "sidebar-baseline.json").exists())
+        self.sidebar_sync()
+        self.assertEqual(self.read_sidebar(self.homes[1])["thread-project-assignments"]["t1"]["projectId"],
+                         "local-a")
+
+    def test_sidebar_removals_and_moves_sync_both_ways(self):
+        self.write_sidebar(self.homes[0], [("local-a", "A", "/tmp/a"), ("local-b", "B", "/tmp/b")],
+                           [("t1", "local-a"), ("t2", "local-b")])
+        self.write_sidebar(self.homes[1], [])
+        self.sidebar_sync()
+        work = self.read_sidebar(self.homes[1])
+        del work["local-projects"]["local-b"]
+        work["project-order"].remove("local-b")
+        del work["thread-project-assignments"]["t2"]
+        work["thread-project-assignments"]["t1"] = {"projectKind": "local", "projectId": "local-a"}
+        work["projectless-thread-ids"] = []
+        (self.homes[1] / sync.GLOBAL_STATE).write_text(json.dumps(work))
+        default = self.read_sidebar(self.homes[0])
+        del default["thread-project-assignments"]["t1"]
+        default["projectless-thread-ids"] = ["t1"]
+        (self.homes[0] / sync.GLOBAL_STATE).write_text(json.dumps(default))
+        self.sidebar_sync()
+        for home in self.homes:
+            state = self.read_sidebar(home)
+            self.assertEqual(list(state["local-projects"]), ["local-a"])
+            self.assertNotIn("t2", state["thread-project-assignments"])
+            self.assertEqual(state["projectless-thread-ids"], ["t1"])
 
     def test_launch_agent_runs_same_pair_every_15_seconds(self):
         plist = sync.agent_plist("test", Path("/repo/tools/session_sync.py"), *self.homes, self.folder)

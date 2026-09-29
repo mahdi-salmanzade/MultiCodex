@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Sync sidebar projects and the chats filed under them. Each app keeps its project list and thread assignments in its own `.codex-global-state.json` under app-specific IDs, so synced chats showed up without their projects. Projects are now matched by folder and merged both ways, including renames, removals and moves between projects; an app's file is updated only while that app is closed, because it reads the file once at launch and overwrites it while running.
 - Fix `install` downloading the wrong application. The old download link now serves the separate ChatGPT chat app (`com.openai.chat`), which the bundle identifier check rejected, so a fresh install could not succeed. `install` now downloads Codex from `codex-app-prod/Codex.dmg`, the link the Codex app itself uses.
 
 - Stop profiles from capturing `codex://` links system-wide. Every clone inherited the official app's claim on `codex:`, `http:` and `https:`, and macOS binds one handler per scheme, so the most recently launched profile silently took every deep link — an MCP login could complete in a different profile than the one that started it. Each profile now declares only `codex-<name>:` and leaves the shared schemes to the official app.
