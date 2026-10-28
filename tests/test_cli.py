@@ -79,7 +79,7 @@ class CLIBehavior(unittest.TestCase):
         profile = self.root / "profiles/work"
         self.assertEqual(
             (profile / ".multicodex").read_text(),
-            "color=blue\nsource_version=1.2.3\nsource_build=10\n",
+            "color=blue\nsource_version=1.2.3\nsource_build=10\nlauncher_revision=2\n",
         )
         self.assertEqual(profile.stat().st_mode & 0o777, 0o700)
         self.assertEqual((self.root / "data/work").stat().st_mode & 0o777, 0o700)
@@ -260,6 +260,15 @@ main launch --all
         self.run_shell("cmd_sync --force work")
         self.assertEqual((self.root / "builds").read_text().splitlines(), ["work", "work"])
 
+    def test_sync_migrates_launchers_that_run_resigned_codex(self):
+        self.create()
+        metadata = self.root / "profiles/work/.multicodex"
+        metadata.write_text(metadata.read_text().replace("launcher_revision=2\n", ""))
+        self.assertIn("stale", self.run_shell("cmd_list").stdout)
+        self.run_shell("cmd_sync work")
+        self.assertEqual((self.root / "builds").read_text().splitlines(), ["work", "work"])
+        self.assertIn("launcher_revision=2", metadata.read_text())
+
     def test_launch_all_reports_failure_and_continues(self):
         self.create("broken", "red")
         self.create("work", "blue")
@@ -293,6 +302,26 @@ profile_running 'client.one'
             f"{self.root}/apps/Codex client.one.app/Contents/MacOS/ChatGPT\n"
         )
         self.run_shell(script)
+
+    def test_running_detection_matches_official_runtime_and_exact_profile(self):
+        process_file = self.root / "processes"
+        script = 'ps() { cat "$TEST_DIR/processes"; }; profile_running work'
+        data = self.root / "data/work"
+        runtime = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        for command in (
+            f"{runtime} --user-data-dir={data}",
+            f"{runtime} --user-data-dir={data} --flag=value",
+        ):
+            process_file.write_text(command + "\n")
+            self.run_shell(script)
+        for command in (
+            runtime,
+            f"{runtime} --user-data-dir={data}-other",
+            f"{runtime} --user-data-dir={self.root}/data/personal",
+            f"/Applications/ChatGPT.app/Contents/Frameworks/Electron.framework/Helpers/Helper.app/Contents/MacOS/Helper --user-data-dir={data}",
+        ):
+            process_file.write_text(command + "\n")
+            self.run_shell(script, success=False)
 
     def test_sync_migrates_legacy_metadata(self):
         self.create()
@@ -409,6 +438,48 @@ class AssetLookup(unittest.TestCase):
             self_dir, icon_dir = result.stdout.split()
             self.assertEqual(Path(self_dir), REPO)
             self.assertTrue(Path(icon_dir).is_dir(), icon_dir)
+
+
+class OfficialRuntimeLauncher(unittest.TestCase):
+    def test_executes_original_runtime_with_isolation_and_forwarded_arguments(self):
+        with tempfile.TemporaryDirectory(prefix="multicodex-launcher-") as temp:
+            root = Path(temp)
+            # Include shell metacharacters: a configured app path must be a
+            # literal path when embedded in the generated Bash launcher.
+            source = root / "Official 'app' $(literal).app"
+            runtime = source / "Contents/MacOS/ChatGPT"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text('#!/bin/bash\nprintf "%s\\n" official "$CODEX_HOME" "$CODEX_ELECTRON_USER_DATA_PATH" "$@"\n')
+            runtime.chmod(0o755)
+            commands = root / "commands"
+            commands.mkdir()
+            # The launcher normally creates its profile dirs. Stub mkdir so
+            # this test never creates a real user's Electron data directory.
+            (commands / "mkdir").write_text("#!/bin/bash\nexit 0\n")
+            (commands / "mkdir").chmod(0o755)
+            launcher = root / "launcher"
+            env = dict(os.environ, MULTICODEX_APP=str(source),
+                       MULTICODEX_ROOT=str(root / "profiles"),
+                       PATH=f"{commands}:/usr/bin:/bin")
+            result = subprocess.run([
+                "/bin/bash", "-c", 'source "$1"; write_profile_launcher "$2" work ChatGPT',
+                "test", str(CLI), str(launcher),
+            ], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            del env["MULTICODEX_APP"]  # Finder uses the literal build-time path.
+            args = ["codex://threads/test?view=review", "--argument=with spaces"]
+            result = subprocess.run([str(launcher), *args], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "official", str(root / "profiles/work"),
+                str(Path.home() / "Library/Application Support/MultiCodex/work"),
+                f"--user-data-dir={Path.home()}/Library/Application Support/MultiCodex/work", *args,
+            ])
+            self.assertFalse((root / "profiles").exists())
+            env["MULTICODEX_APP"] = str(root / "missing.app")
+            result = subprocess.run([str(launcher)], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("official app executable missing", result.stderr)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ For changes to cloning, signing, or launch behavior, also manually verify on a M
 
 ## Icons
 
-The ten generated icons are committed, so normal users do not need Python or Pillow. To regenerate them on macOS:
+The ten generated icons are committed, so creating and launching profiles does not require Python or Pillow. Optional conversation sharing requires Python 3; regenerating icons also requires Pillow. To regenerate them on macOS:
 
 ```sh
 python3 -m venv .venv
@@ -31,7 +31,7 @@ python3 tools/make_icons.py
 python3 tools/make_icons.py --only red
 ```
 
-Use `--source /path/to/source.icns` for other source artwork and `--out /path/to/output` for a temporary output directory. Check the result at small Dock sizes and in light and dark appearances. Respect the artwork exclusions in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Use `--source /path/to/source.icns` for other source artwork and `--out /path/to/output` for a temporary output directory. Check the result at small Finder and Spotlight sizes and in light and dark appearances. These colors brand the launchers; running apps use the official app's Dock icon setting. Respect the artwork exclusions in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Proposing changes
 
@@ -40,6 +40,7 @@ Open an issue describing the problem and a reproducible example. Keep changes fo
 Preserve these design choices:
 
 - Create profiles from the user's installed official app.
+- Execute the untouched official runtime so built-in chat tools retain its trusted signing identity.
 - Avoid release-specific patches to Codex's application code.
 - Keep account and Electron state separate, with both isolation variables supplied at launch.
 - Keep profile management local and free of telemetry or a required backend.

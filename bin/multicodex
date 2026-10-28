@@ -1,10 +1,10 @@
 #!/bin/bash
 # multicodex — install ChatGPT/Codex and run several isolated accounts on one Mac.
 #
-# Each profile is an APFS clone of the official app, rebranded with its own name,
-# colour and bundle identifier, then re-signed so macOS treats it as a distinct
-# application: separate Dock tile, separate Cmd-Tab entry, separate privacy
-# grants. Cloning is copy-on-write, so a profile costs seconds and almost no disk.
+# Each profile has a branded launcher cloned from the official app. Its launcher
+# executes the untouched source app so native app-tools retain the trusted code
+# identities they require. Account data is isolated; running app branding and
+# macOS privacy identity come from the official runtime.
 #
 # Account isolation uses ChatGPT's own mechanism: CODEX_HOME for credentials and
 # CODEX_ELECTRON_USER_DATA_PATH for the Electron profile. The second variable is
@@ -25,7 +25,7 @@ readonly PROFILE_ROOT="${MULTICODEX_ROOT:-$HOME/.multicodex/profiles}"
 readonly DATA_ROOT="$HOME/Library/Application Support/MultiCodex"
 readonly APP_DIR="$HOME/Applications"
 
-# The documented install links this script into ~/.local/bin, and BASH_SOURCE
+# A user may link this script into ~/.local/bin, and BASH_SOURCE
 # reports the link's own path, so the repository holding the icons is only
 # reachable by following the link back first.
 resolve_self() {
@@ -43,6 +43,7 @@ readonly ICON_DIR="${MULTICODEX_ICONS:-$SELF/assets/icons}"
 
 readonly COLORS="blue green purple orange red teal pink yellow indigo graphite"
 readonly LAUNCHER_NAME="multicodex-launcher"
+readonly LAUNCHER_REVISION="2"
 readonly LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 # ---------------------------------------------------------------- output
@@ -123,14 +124,24 @@ next_color() {
 
 require_app() { [ -d "$APP" ] || die "ChatGPT is not installed. Run: multicodex install"; }
 
-# True when a profile's own application is running. Matching on the bundle path
-# avoids false positives from its Computer Use helper, which lives under the
-# profile directory and outlives the app.
+# New launchers execute the untouched official app with a profile data argument.
+# Keep recognizing older copies by bundle path, too. Ignore framework helpers,
+# which may outlive the main process and carry the same data argument.
 profile_running() {
-    ps -axo comm= 2>/dev/null | awk -v prefix="$(profile_app "$1")/Contents/MacOS/" '
+    ps -axww -o command= 2>/dev/null | awk \
+        -v prefix="$(profile_app "$1")/Contents/MacOS/" \
+        -v data_arg=" --user-data-dir=$(data_dir "$1")" '
         index($0, prefix) == 1 {
             executable = substr($0, length(prefix) + 1)
+            sub(/ .*/, "", executable)
             if (executable != "" && index(executable, "/") == 0) found = 1
+        }
+        index($0, "/Contents/MacOS/") && !index($0, "/Contents/Frameworks/") {
+            start = index($0, data_arg)
+            if (start) {
+                rest = substr($0, start + length(data_arg))
+                if (rest == "" || substr(rest, 1, 1) == " ") found = 1
+            }
         }
         END { exit !found }
     '
@@ -143,8 +154,7 @@ refresh_icon_cache() {
     killall Dock >/dev/null 2>&1 || true
 }
 
-# Prefer a team-backed certificate: ad-hoc signatures change on every re-sign,
-# which makes macOS forget the privacy grants a profile has been given.
+# Prefer a team-backed certificate for stable launcher signatures.
 signing_identity() {
     if [ -n "${MULTICODEX_SIGNING_IDENTITY:-}" ]; then
         printf '%s\n' "$MULTICODEX_SIGNING_IDENTITY"; return
@@ -215,14 +225,10 @@ cmd_install() {
 
 # ---------------------------------------------------------------- build
 
-# Every clone inherits CFBundleURLTypes from the official app, so each one
-# claims `codex:` — and `http:`/`https:` with it. LaunchServices binds a single
-# handler per scheme, and the app re-claims `codex:` as it starts, so the most
-# recently launched clone silently captures every codex:// link on the system.
-# The OAuth callback that completes an MCP login is such a link, which is how a
-# login started in one profile ends up opening another. Each clone therefore
-# keeps only a scheme of its own, and the shared ones are left to the official
-# app.
+# The source declares URL schemes such as `codex:`, `http:` and `https:`.
+# Give each branded launcher its own schemes so registering it cannot replace
+# the official app's shared handlers. Running profiles execute the official app;
+# these launcher registrations do not make external URLs profile-aware.
 namespace_url_schemes() {
     local plist="$1" name="$2" suffix i j scheme schemes url_name emptied=""
     suffix="$(scheme_suffix "$name")"
@@ -266,6 +272,37 @@ namespace_url_schemes() {
     ok "url scheme: codex-$suffix: (codex: stays with the official app)"
 }
 
+# Write a profile launcher without altering the official runtime it executes.
+write_profile_launcher() {
+    local launcher="$1" name="$2" real="$3" source_literal executable_literal
+    printf -v source_literal '%q' "$APP"
+    printf -v executable_literal '%q' "$real"
+    cat > "$launcher" <<LAUNCHER
+#!/bin/bash
+set -eu
+# The profile name is fixed at build time. Deriving it from the bundle name
+# would silently open a different, empty profile if the app were ever renamed.
+profile="$name"
+source_app=$source_literal
+source_executable=$executable_literal
+if [ -n "\${MULTICODEX_APP:-}" ]; then source_app="\$MULTICODEX_APP"; fi
+
+profile_home="\${MULTICODEX_ROOT:-\$HOME/.multicodex/profiles}/\$profile"
+data="\$HOME/Library/Application Support/MultiCodex/\$profile"
+mkdir -p -m 700 "\$profile_home" "\$data" 2>/dev/null || true
+
+export CODEX_HOME="\$profile_home"
+export CODEX_ELECTRON_USER_DATA_PATH="\$data"
+runtime="\$source_app/Contents/MacOS/\$source_executable"
+if [ ! -x "\$runtime" ]; then
+    printf 'MultiCodex: official app executable missing: %s\\nRun multicodex sync after setting MULTICODEX_APP to its current location.\\n' "\$runtime" >&2
+    exit 1
+fi
+exec "\$runtime" --user-data-dir="\$data" "\$@"
+LAUNCHER
+    chmod +x "$launcher"
+}
+
 # Clone, rebrand and re-sign one profile application.
 build_profile_app() {
     local name="$1" color="$2" target
@@ -280,7 +317,7 @@ build_profile_app() {
 
     local identity
     identity="$(signing_identity)"
-    [ "$identity" = "-" ] && warn "no signing certificate found; using an ad-hoc signature (privacy grants may reset on each sync)"
+    [ "$identity" = "-" ] && warn "no signing certificate found; signing the launcher ad hoc"
 
     info "cloning $(app_version "$APP") (copy-on-write)"
     mkdir -p "$APP_DIR"
@@ -310,34 +347,16 @@ build_profile_app() {
         warn "icon for '$color' missing — run: python3 tools/make_icons.py"
     fi
 
-    # Install a launcher as the bundle's main executable so the app carries its
-    # own isolation settings. Electron takes its data directory only from
-    # --user-data-dir, and a Finder, Dock or Spotlight launch cannot pass
-    # arguments. Without this the app falls back to the shared default directory,
-    # finds the session another instance already owns, prints "Opening in
-    # existing browser session." and exits — so profiles appear not to open at
-    # all once any other instance is running.
+    # Native app-tools authenticate the executable identities in the caller's
+    # process ancestry. Re-signing Codex changes its identity and makes the
+    # service reject its own MCP subprocesses, hiding list_threads/read_thread.
+    # Keep the branded bundle as a launcher, and execute the untouched official
+    # app with this profile's isolation settings, including from Finder/Dock.
     local macos real
     macos="$target/Contents/MacOS"
     real="$(defaults read "$plist" CFBundleExecutable 2>/dev/null || echo ChatGPT)"
     if [ "$real" != "$LAUNCHER_NAME" ] && [ -x "$macos/$real" ]; then
-        cat > "$macos/$LAUNCHER_NAME" <<LAUNCHER
-#!/bin/bash
-set -eu
-here="\$(cd -- "\$(dirname -- "\$0")" && pwd)"
-# The profile name is fixed at build time. Deriving it from the bundle name
-# would silently open a different, empty profile if the app were ever renamed.
-profile="$name"
-
-home="\${MULTICODEX_ROOT:-\$HOME/.multicodex/profiles}/\$profile"
-data="\$HOME/Library/Application Support/MultiCodex/\$profile"
-mkdir -p -m 700 "\$home" "\$data" 2>/dev/null || true
-
-export CODEX_HOME="\$home"
-export CODEX_ELECTRON_USER_DATA_PATH="\$data"
-exec "\$here/$real" --user-data-dir="\$data" "\$@"
-LAUNCHER
-        chmod +x "$macos/$LAUNCHER_NAME"
+        write_profile_launcher "$macos/$LAUNCHER_NAME" "$name" "$real"
         /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $LAUNCHER_NAME" "$plist" >/dev/null 2>&1 || true
         ok "self-contained launcher installed"
     fi
@@ -379,7 +398,7 @@ cmd_create() {
     build_profile_app "$name" "$color"
     app="$(profile_app "$name")"
 
-    printf 'color=%s\nsource_version=%s\nsource_build=%s\n' "$color" "$(app_version "$APP")" "$(app_build "$APP")" > "$(meta_file "$name")"
+    printf 'color=%s\nsource_version=%s\nsource_build=%s\nlauncher_revision=%s\n' "$color" "$(app_version "$APP")" "$(app_build "$APP")" "$LAUNCHER_REVISION" > "$(meta_file "$name")"
 
     printf '\n'
     ok "app         $app"
@@ -388,7 +407,7 @@ cmd_create() {
 
     printf '\n'
     info "launch:  multicodex launch $name"
-    info "always launch through multicodex so this profile receives its isolated settings"
+    info "Finder and Spotlight can also start this named profile launcher"
 }
 
 cmd_sync() {
@@ -435,6 +454,7 @@ cmd_sync() {
         if [ "$force" = "false" ] \
             && [ "$was" = "$current" ] \
             && [ "$(meta_get "$name" source_build)" = "$current_build" ] \
+            && [ "$(meta_get "$name" launcher_revision)" = "$LAUNCHER_REVISION" ] \
             && [ -d "$(profile_app "$name")" ] \
             && [ -x "$(profile_app "$name")/Contents/MacOS/$LAUNCHER_NAME" ]; then
             ok "$name already on $current"
@@ -445,7 +465,7 @@ cmd_sync() {
             warn "$name not updated"
             continue
         fi
-        printf 'color=%s\nsource_version=%s\nsource_build=%s\n' "$color" "$current" "$current_build" > "$(meta_file "$name")"
+        printf 'color=%s\nsource_version=%s\nsource_build=%s\nlauncher_revision=%s\n' "$color" "$current" "$current_build" "$LAUNCHER_REVISION" > "$(meta_file "$name")"
         ok "$name updated"
     done
     refresh_icon_cache
@@ -616,7 +636,8 @@ cmd_list() {
         name="$(basename "$dir")"
         if [ -d "$(profile_app "$name")" ]; then
             ver="$(meta_get "$name" source_version)"
-            if [ "$ver" = "$current" ] && [ "$(meta_get "$name" source_build)" = "$current_build" ]; then
+            if [ "$ver" = "$current" ] && [ "$(meta_get "$name" source_build)" = "$current_build" ] \
+                && [ "$(meta_get "$name" launcher_revision)" = "$LAUNCHER_REVISION" ]; then
                 status="up to date"
             else
                 status="stale — run sync"
@@ -672,11 +693,13 @@ cmd_doctor() {
     fi
 
     local handler; handler="$(default_url_handler codex)"
-    if [ -z "$handler" ] || [ "$handler" = "$OPENAI_BUNDLE_ID" ]; then
-        ok "codex: links open the official app"
+    if [ -z "$handler" ]; then
+        info "codex: no explicit URL handler override is recorded"
+    elif [ "$handler" = "$OPENAI_BUNDLE_ID" ]; then
+        ok "codex: registered to the official app (URLs do not select a profile)"
     else
-        warn "codex: links open '$handler' — deep links and MCP logins land in that profile"
-        warn "run 'multicodex sync --force' to stop profiles claiming the shared scheme"
+        warn "codex: registered to '$handler' — external links may open that app"
+        warn "run 'multicodex sync --force' to remove old launcher claims, then open the official app"
     fi
 
     local identity; identity="$(signing_identity)"
@@ -700,12 +723,12 @@ usage() {
     cat <<USAGE
 multicodex $VERSION — several ChatGPT/Codex accounts on one Mac
 
-  multicodex install                    download and install the latest ChatGPT
-  multicodex create <name> [--color c]  create a profile with its own app
+  multicodex install                    download and install the official ChatGPT/Codex app
+  multicodex create <name> [--color c]  create a profile and its named launcher
   multicodex launch <name>              launch a profile
   multicodex launch --all               launch every profile
   multicodex list                       list profiles and their state
-  multicodex sync [--force] [name]      rebuild profiles after a ChatGPT update
+  multicodex sync [--force] [name]      rebuild outdated launchers (--force: always)
   multicodex repair <name> [--from path] restore access after moving a profile
   multicodex sessions sync <name>       sync chats both ways with default Codex
   multicodex sessions enable <name>     keep chats synced every 15 seconds
@@ -715,10 +738,10 @@ multicodex $VERSION — several ChatGPT/Codex accounts on one Mac
   multicodex colors                     show available colours
   multicodex doctor                     check the installation
 
-Every profile is a copy-on-write clone of the official app with its own name,
-colour, bundle id and signature, so macOS treats it as a separate application
-with its own Dock tile and privacy grants. Accounts are isolated through
-CODEX_HOME. Run 'multicodex sync' after ChatGPT updates.
+Every profile has a named, coloured launcher that executes the untouched
+official app with separate account and Electron data directories. Running
+instances use the official app's Dock branding and privacy identity. Keep the
+official app installed, and run 'multicodex sync' after ChatGPT updates.
 USAGE
 }
 

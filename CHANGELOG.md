@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Replace the old Dock preview and illustrated walkthrough with actual annotated settings screenshots. Correct launcher, sync, privacy, requirements, and Dock-icon guidance for profiles running through the official app.
+- Restore built-in chat tools in profile apps (#1). Their native service rejected locally re-signed Codex executables with `untrusted-code-signing-identity`, hiding `list_threads`, `read_thread`, and `send_message_to_thread`. Launchers now execute the untouched official app with each profile's existing isolated directories. `sync` automatically migrates older launchers, and running-profile detection recognizes the official runtime by its exact data directory. Finder launchers retain their branding; running instances share the official app's Dock branding and privacy identity. No application JavaScript or trust checks are modified.
 - Sync sidebar projects and the chats filed under them. Each app keeps its project list and thread assignments in its own `.codex-global-state.json` under app-specific IDs, so synced chats showed up without their projects. Projects are now matched by folder and merged both ways, including renames, removals and moves between projects; an app's file is updated only while that app is closed, because it reads the file once at launch and overwrites it while running.
 - Fix `install` downloading the wrong application. The old download link now serves the separate ChatGPT chat app (`com.openai.chat`), which the bundle identifier check rejected, so a fresh install could not succeed. `install` now downloads Codex from `codex-app-prod/Codex.dmg`, the link the Codex app itself uses.
 
