@@ -541,7 +541,8 @@ repair_legacy_paths_on_launch() {
                 sessions/*|archived_sessions/*) ;;
                 *) continue ;;
             esac
-            [ -f "$profile_home/$relative" ] || continue
+            # Codex compresses finished rollouts in place but keeps the plain path.
+            [ -f "$profile_home/$relative" ] || [ -f "$profile_home/$relative.zst" ] || continue
             if ! (repair_profile_paths "$name" "$old_home"); then
                 warn "$name: legacy session paths could not be repaired; inspect the old location, then run: multicodex repair $name"
             fi
@@ -605,8 +606,8 @@ cmd_launch_all() {
 cmd_list() {
     local current="" current_build=""
     if [ -d "$APP" ]; then current="$(app_version "$APP")"; current_build="$(app_build "$APP")"; fi
-    printf '%-14s %-10s %-8s %-12s %s\n' "PROFILE" "COLOUR" "AUTH" "VERSION" "STATUS"
-    printf '%-14s %-10s %-8s %-12s %s\n' "default" "-" \
+    printf '%-14s %-10s %-8s %-14s %s\n' "PROFILE" "COLOUR" "AUTH" "VERSION" "STATUS"
+    printf '%-14s %-10s %-8s %-14s %s\n' "default" "-" \
         "$([ -f "$HOME/.codex/auth.json" ] && echo yes || echo no)" "$current" "official app"
 
     [ -d "$PROFILE_ROOT" ] || return 0
@@ -624,7 +625,7 @@ cmd_list() {
         else
             ver="-"; status="app missing — run sync"
         fi
-        printf '%-14s %-10s %-8s %-12s %s\n' "$name" "$(meta_get "$name" color)" \
+        printf '%-14s %-10s %-8s %-14s %s\n' "$name" "$(meta_get "$name" color)" \
             "$([ -f "$dir/auth.json" ] && echo yes || echo no)" "$ver" "$status"
     done
 }
@@ -636,12 +637,21 @@ cmd_remove() {
     local profile_home data app
     profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"; app="$(profile_app "$name")"
     [ -d "$profile_home" ] || die "no profile named '$name'"
+    profile_running "$name" && die "profile '$name' is running — quit Codex $name first"
 
     printf 'This permanently deletes:\n  %s\n  %s\n' "$profile_home" "$data"
     [ -d "$app" ] && printf '  %s\n' "$app"
     printf 'Type the profile name to confirm: '
     local reply; read -r reply
     [ "$reply" = "$name" ] || die "cancelled"
+    # A sync agent left behind would fail every 15 seconds on the missing home.
+    local plist
+    for plist in "$HOME"/Library/LaunchAgents/local.multicodex.sessions.*.plist; do
+        [ -f "$plist" ] && grep -qF "<string>$profile_home</string>" "$plist" || continue
+        launchctl bootout "gui/$(id -u)/$(basename "$plist" .plist)" >/dev/null 2>&1 || true
+        rm -f "$plist"
+        ok "stopped its session sync"
+    done
     rm -rf "$profile_home" "$data" "$app"
     ok "removed profile '$name'"
 }
@@ -676,7 +686,7 @@ cmd_doctor() {
         ok "codex: links open the official app"
     else
         warn "codex: links open '$handler' — deep links and MCP logins land in that profile"
-        warn "run 'multicodex sync --force' to stop profiles claiming the shared scheme"
+        warn "each app re-claims codex: as it starts; reopen the official app last to take it back"
     fi
 
     local identity; identity="$(signing_identity)"
@@ -685,6 +695,12 @@ cmd_doctor() {
     else
         ok "signing identity: $identity"
     fi
+
+    local failure
+    for failure in "$HOME"/.multicodex/session-sync/*/error.json; do
+        [ -f "$failure" ] || continue
+        warn "session sync failing: $(sed -E 's/.*"error": "([^"]*)".*/\1/' "$failure")"
+    done
 
     local n=0 icons=0
     [ -d "$PROFILE_ROOT" ] && n="$(find "$PROFILE_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"

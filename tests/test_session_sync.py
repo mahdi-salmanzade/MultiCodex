@@ -145,6 +145,20 @@ class SessionSync(unittest.TestCase):
         self.run_sync()
         self.assertEqual(self.rows(self.homes[1], "threads"), [])
 
+    def test_compressed_rollout_still_syncs(self):
+        path = self.seed(self.homes[0], "chat")
+        path.rename(path.with_name(path.name + ".zst"))
+        self.run_sync()
+        self.assertEqual(self.rows(self.homes[1], "threads")[0][1], str(path.resolve()))
+
+    def test_agent_logs_are_trimmed(self):
+        self.seed(self.homes[0], "chat")
+        self.folder.mkdir()
+        log = self.folder / "agent.log"
+        log.write_bytes(b"x" * (sync.LOG_LIMIT + 1))
+        self.run_sync()
+        self.assertEqual(log.stat().st_size, 0)
+
     def test_simultaneous_metadata_changes_choose_latest(self):
         self.seed(self.homes[0], "chat")
         self.run_sync()
@@ -226,6 +240,15 @@ class SessionSync(unittest.TestCase):
             self.assertEqual(list(state["local-projects"]), ["local-a"])
             self.assertNotIn("t2", state["thread-project-assignments"])
             self.assertEqual(state["projectless-thread-ids"], ["t1"])
+
+    def test_sidebar_does_not_copy_account_backed_project_fields(self):
+        self.write_sidebar(self.homes[0], [("local-a", "A", "/tmp/a")])
+        self.write_sidebar(self.homes[1], [])
+        state = self.read_sidebar(self.homes[0])
+        state["local-projects"]["local-a"]["chatGptBacking"] = {"accountId": "default-account"}
+        (self.homes[0] / sync.GLOBAL_STATE).write_text(json.dumps(state))
+        self.sidebar_sync()
+        self.assertNotIn("chatGptBacking", self.read_sidebar(self.homes[1])["local-projects"]["local-a"])
 
     def test_launch_agent_runs_same_pair_every_15_seconds(self):
         plist = sync.agent_plist("test", Path("/repo/tools/session_sync.py"), *self.homes, self.folder)

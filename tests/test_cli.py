@@ -136,6 +136,13 @@ class CLIBehavior(unittest.TestCase):
         self.run_shell("main launch work")
         self.assertEqual((old / relative).read_bytes(), (profile / relative).read_bytes())
 
+    def test_launch_repairs_compressed_sessions(self):
+        profile, old, relative = self.moved_session()
+        path = profile / relative
+        path.rename(path.with_name(path.name + ".zst"))
+        self.run_shell("main launch work")
+        self.assertEqual(old.resolve(), profile.resolve())
+
     def test_launch_does_not_claim_old_path_without_matching_session(self):
         profile, old, relative = self.moved_session()
         (profile / relative).unlink()
@@ -323,6 +330,37 @@ profile_running 'client.one'
         self.assertFalse((self.root / "data/work").exists())
         self.assertFalse((self.root / "apps/Codex work.app").exists())
         self.assertTrue((self.root / "profiles/personal").exists())
+
+    def test_remove_refuses_a_running_profile(self):
+        self.create()
+        result = self.run_shell("profile_running() { return 0; }; cmd_remove work",
+                                input="work\n", success=False)
+        self.assertIn("is running", result.stderr)
+        self.assertTrue((self.root / "profiles/work").exists())
+
+    def test_remove_stops_only_the_sync_agents_using_that_profile(self):
+        self.create()
+        self.env["HOME"] = str(self.root)
+        agents = self.root / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        home = self.root / "profiles/work"
+        for label, peer in (("mine", home), ("other", self.root / "profiles/personal")):
+            with (agents / f"local.multicodex.sessions.{label}.plist").open("wb") as f:
+                plistlib.dump({"ProgramArguments": [str(peer)]}, f)
+        self.run_shell('launchctl() { printf "%s\\n" "$2" >> "$TEST_DIR/bootouts"; }; cmd_remove work',
+                       input="work\n")
+        self.assertIn("local.multicodex.sessions.mine", (self.root / "bootouts").read_text())
+        self.assertNotIn("other", (self.root / "bootouts").read_text())
+        self.assertFalse((agents / "local.multicodex.sessions.mine.plist").exists())
+        self.assertTrue((agents / "local.multicodex.sessions.other.plist").exists())
+
+    def test_doctor_reports_a_failing_session_sync(self):
+        self.env["HOME"] = str(self.root)
+        folder = self.root / ".multicodex/session-sync/pair"
+        folder.mkdir(parents=True)
+        (folder / "error.json").write_text('{"error": "Different threads schemas", "time": "now"}')
+        result = self.run_shell("cmd_doctor")
+        self.assertIn("session sync failing: Different threads schemas", result.stderr)
 
     def test_download_identity_verification(self):
         mock = r'''

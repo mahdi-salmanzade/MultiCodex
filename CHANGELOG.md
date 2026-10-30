@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Keep syncing conversations after Codex compresses them. Codex now stores finished rollouts as `<name>.jsonl.zst` while still recording `<name>.jsonl`, so sync treated them as missing and silently skipped those conversations. Launch-time path repair had the same blind spot.
+- Copy only a project's shared fields between apps, so a backing tied to one ChatGPT account cannot reach another.
+- Stop the sync agent's logs growing without limit.
+- Report a failing session sync in `doctor`, and say what to do about a schema mismatch: history databases upgrade only once a conversation has been opened.
+- Refuse to `remove` a running profile, and stop any sync agent that depends on the removed profile.
+- Correct `doctor`'s advice about `codex:` links: every app claims the scheme as it starts, so rebuilding does not release it; opening the official app last does.
+- Keep `list` aligned with longer version numbers.
+
 - Sync sidebar projects and the chats filed under them. Each app keeps its project list and thread assignments in its own `.codex-global-state.json` under app-specific IDs, so synced chats showed up without their projects. Projects are now matched by folder and merged both ways, including renames, removals and moves between projects; an app's file is updated only while that app is closed, because it reads the file once at launch and overwrites it while running.
 - Fix `install` downloading the wrong application. The old download link now serves the separate ChatGPT chat app (`com.openai.chat`), which the bundle identifier check rejected, so a fresh install could not succeed. `install` now downloads Codex from `codex-app-prod/Codex.dmg`, the link the Codex app itself uses.
 

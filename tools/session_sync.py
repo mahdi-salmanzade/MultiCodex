@@ -27,6 +27,9 @@ HISTORY_TABLES = (
 )
 
 
+LOG_LIMIT = 1024 * 1024
+
+
 def write_json(path, value):
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(value, sort_keys=True))
@@ -65,7 +68,8 @@ def schema(db, tables):
         if not left and not right:
             continue
         if left != right:
-            raise ValueError(f"Different {table} schemas; update both Codex apps before syncing")
+            raise ValueError(f"Different {table} schemas; update both Codex apps to the same "
+                             "version and open a conversation in each, then sync again")
         columns = [r[1] for r in left]
         keys = [r[1] for r in sorted(left, key=lambda r: r[5]) if r[5]]
         if not keys:
@@ -83,6 +87,12 @@ def upsert_sql(side, table, columns, keys, select=None):
     values = select or "VALUES (" + ",".join("?" for _ in columns) + ")"
     action = "DO UPDATE SET " + updates if updates else "DO NOTHING"
     return f'INSERT INTO {side}."{table}" ({names}) {values} ON CONFLICT ({conflict}) {action}'
+
+
+def rollout_exists(path):
+    # Codex compresses finished rollouts in place to <name>.jsonl.zst but keeps
+    # recording <name>.jsonl, so the plain path alone does not mean it is gone.
+    return path.is_file() or path.with_name(path.name + ".zst").is_file()
 
 
 def timestamp(row):
@@ -126,7 +136,7 @@ def merge_state(left, right, baseline):
                         conflicts += 1
                     if table == "threads":
                         path = Path(winner["rollout_path"])
-                        if not path.is_file():
+                        if not rollout_exists(path):
                             # Do not import broken paths or replace a valid peer
                             # with an archive move that has not finished yet.
                             continue
@@ -187,6 +197,7 @@ GLOBAL_STATE = ".codex-global-state.json"
 PROJECTS, ORDER = "local-projects", "project-order"
 ASSIGNMENTS, PROJECTLESS = "thread-project-assignments", "projectless-thread-ids"
 PINNED_PROJECTS = "pinned-project-ids"
+PROJECT_FIELDS = ("id", "name", "rootPaths", "createdAt", "updatedAt")
 DEFAULT_HOME = Path.home() / ".codex"
 
 
@@ -258,6 +269,9 @@ def apply_sidebar(state, merged, peer):
     added = []
     for key in sorted(wanted.keys() - ids.keys()):
         source = peer_projects.get(key) or {"rootPaths": json.loads(key), "createdAt": 0, "updatedAt": 0}
+        # Copy only the shared fields: a project can also carry a backing tied
+        # to the ChatGPT account of the app that created it.
+        source = {k: source[k] for k in PROJECT_FIELDS if k in source}
         pid = source.get("id") if source.get("id") and source.get("id") not in projects else None
         pid = pid or "local-" + hashlib.sha256(key.encode()).hexdigest()[:32]
         projects[pid] = dict(source, id=pid, name=wanted[key])
@@ -368,10 +382,19 @@ def backup_databases(paths, folder):
     write_json(complete, {"sources": [str(p) for p in paths]})
 
 
+def trim_logs(folder):
+    # The agent appends a line every 15 seconds for as long as it stays enabled.
+    for name in ("agent.log", "agent-error.log"):
+        path = folder / name
+        if path.is_file() and path.stat().st_size > LOG_LIMIT:
+            os.truncate(path, 0)
+
+
 def sync_once(left_home, right_home, folder):
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (folder / "lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        trim_logs(folder)
         left, right = database(left_home, "state"), database(right_home, "state")
         lh, rh = database(left_home, "thread_history"), database(right_home, "thread_history")
         # Validate all schemas before touching either database or making backups.
