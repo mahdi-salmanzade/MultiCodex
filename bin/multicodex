@@ -671,7 +671,7 @@ cmd_doctor() {
     if [ -d "$APP" ]; then
         ok "ChatGPT $(app_version "$APP")"
         local team
-        team="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+        team="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p' || true)"
         if [ "$team" = "$OPENAI_TEAM_ID" ]; then
             ok "official app signed by OpenAI ($team)"
         else

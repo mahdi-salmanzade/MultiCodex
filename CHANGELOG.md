@@ -8,6 +8,7 @@
 - Report a failing session sync in `doctor`, and say what to do about a schema mismatch: history databases upgrade only once a conversation has been opened.
 - Refuse to `remove` a running profile, and stop any sync agent that depends on the removed profile.
 - Correct `doctor`'s advice about `codex:` links: every app claims the scheme as it starts, so rebuilding does not release it; opening the official app last does.
+- Keep `doctor` running when the app's signature cannot be read, and warn instead of exiting silently.
 - Keep `list` aligned with longer version numbers.
 
 - Sync sidebar projects and the chats filed under them. Each app keeps its project list and thread assignments in its own `.codex-global-state.json` under app-specific IDs, so synced chats showed up without their projects. Projects are now matched by folder and merged both ways, including renames, removals and moves between projects; an app's file is updated only while that app is closed, because it reads the file once at launch and overwrites it while running.
