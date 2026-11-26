@@ -250,6 +250,25 @@ class SessionSync(unittest.TestCase):
         self.sidebar_sync()
         self.assertNotIn("chatGptBacking", self.read_sidebar(self.homes[1])["local-projects"]["local-a"])
 
+    def test_running_apps_are_told_apart_by_their_data_directory(self):
+        official = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        data = "/Users/me/Library/Application Support/MultiCodex"
+        work, other = Path("/profiles/work"), Path("/profiles/workshop")
+        cases = (
+            (official, {sync.DEFAULT_HOME}),
+            (f"{official} --user-data-dir={data}/work", {work}),
+            # Started with a link, which follows the directory on the command line.
+            (f"{official} --user-data-dir={data}/work codex://threads/abc", {work}),
+            (f"/Users/me/Applications/Codex work.app/Contents/MacOS/ChatGPT --user-data-dir={data}/work --flag", {work}),
+            (f"{official} --user-data-dir={data}/workshop codex://threads/work", {other}),
+        )
+        for command, running in cases:
+            with self.subTest(command=command):
+                result = mock.Mock(returncode=0, stdout=command + "\n")
+                with mock.patch.object(sync.subprocess, "run", return_value=result):
+                    found = {home for home in (sync.DEFAULT_HOME, work, other) if sync.app_running(home)}
+                self.assertEqual(found, running)
+
     def test_launch_agent_runs_same_pair_every_15_seconds(self):
         plist = sync.agent_plist("test", Path("/repo/tools/session_sync.py"), *self.homes, self.folder)
         self.assertEqual(plist["StartInterval"], 15)

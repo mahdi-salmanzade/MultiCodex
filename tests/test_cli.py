@@ -23,6 +23,7 @@ app_build() { printf '%s\n' "${TEST_BUILD:-10}"; }
 refresh_icon_cache() { :; }
 build_profile_app() {
     printf '%s\n' "$1" >> "$TEST_DIR/builds"
+    printf '%s\n' "${3:-own}" >> "$TEST_DIR/build-runtimes"
     mkdir -p "$(profile_app "$1")/Contents/MacOS"
     # The real build installs a launcher as the bundle's main executable, and
     # cmd_sync treats a bundle without one as stale. Mirror that here so the
@@ -50,9 +51,9 @@ class CLIBehavior(unittest.TestCase):
             MULTICODEX_APP=str(self.root / "source.app"),
         )
 
-    def run_shell(self, script, *, input=None, success=True):
+    def run_shell(self, script, *, input=None, success=True, harness=HARNESS):
         result = subprocess.run(
-            ["/bin/bash", "-c", HARNESS + "\n" + script],
+            ["/bin/bash", "-c", harness + "\n" + script],
             env=self.env,
             text=True,
             input=input,
@@ -79,7 +80,7 @@ class CLIBehavior(unittest.TestCase):
         profile = self.root / "profiles/work"
         self.assertEqual(
             (profile / ".multicodex").read_text(),
-            "color=blue\nsource_version=1.2.3\nsource_build=10\n",
+            "color=blue\nsource_version=1.2.3\nsource_build=10\nruntime=own\n",
         )
         self.assertEqual(profile.stat().st_mode & 0o777, 0o700)
         self.assertEqual((self.root / "data/work").stat().st_mode & 0o777, 0o700)
@@ -106,6 +107,69 @@ class CLIBehavior(unittest.TestCase):
                 f"--user-data-dir={self.root}/data/{name}",
             ])
         self.assertEqual(args, expected)
+
+    def index_thread(self, home, thread):
+        home.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(home / "state_5.sqlite") as db:
+            db.execute("CREATE TABLE IF NOT EXISTS threads (id TEXT, rollout_path TEXT)")
+            db.execute("INSERT INTO threads VALUES (?, ?)", (thread, "/unused"))
+
+    THREAD = "01a13644-6619-79b2-a18d-e9b6e9ea76bd"
+
+    def test_open_hands_the_link_to_the_chosen_profile(self):
+        self.create()
+        self.index_thread(self.root / "profiles/work", self.THREAD)
+        app = f"{self.root}/apps/Codex work.app"
+        fresh = ["-a", app, "--env", f"CODEX_HOME={self.root}/profiles/work",
+                 "--env", f"CODEX_ELECTRON_USER_DATA_PATH={self.root}/data/work",
+                 f"codex://threads/{self.THREAD}", "--args",
+                 f"--user-data-dir={self.root}/data/work"]
+        result = self.run_shell(f"profile_running() {{ return 1; }}; main open work codex://threads/{self.THREAD}")
+        self.assertEqual((self.root / "launch-args").read_text().splitlines(), fresh)
+        self.assertEqual(result.stderr, "")
+        # A running profile takes the link as it is; a link written for the
+        # profile's private scheme is the same link, which the app only accepts
+        # under codex:.
+        (self.root / "launch-args").unlink()
+        self.run_shell(f"profile_running() {{ return 0; }}; main open work CODEX-work://threads/{self.THREAD}?view=review")
+        self.assertEqual((self.root / "launch-args").read_text().splitlines(),
+                         ["-a", app, f"codex://threads/{self.THREAD}?view=review"])
+
+    def test_open_says_where_an_unshared_chat_lives(self):
+        self.create()
+        self.create("personal", "green")
+        self.env["HOME"] = str(self.root)
+        self.index_thread(self.root / "profiles/work", "00000000-0000-0000-0000-000000000000")
+        link = f"codex://threads/{self.THREAD}"
+        script = f"profile_running() {{ return 1; }}; main open work {link}"
+        self.assertIn("not in any profile", self.run_shell(script).stderr)
+        self.index_thread(self.root / "profiles/personal", self.THREAD)
+        self.assertIn("multicodex sessions sync work --with personal", self.run_shell(script).stderr)
+        self.index_thread(self.root / ".codex", self.THREAD)
+        result = self.run_shell(script)
+        self.assertIn("belongs to 'default'", result.stderr)
+        self.assertTrue(result.stderr.rstrip().endswith("multicodex sessions sync work"))
+        # The link is still delivered: the index check is advice, not a gate.
+        self.assertEqual(len((self.root / "launch-args").read_text().splitlines()), 27)
+
+    def test_open_default_targets_the_official_app(self):
+        self.run_shell("main open default codex://settings")
+        self.assertEqual((self.root / "launch-args").read_text().splitlines(),
+                         ["-a", str(self.root / "source.app"), "codex://settings"])
+
+    def test_open_rejects_anything_but_a_codex_link(self):
+        self.create()
+        for command in (
+            "main open", "main open work", "main open work codex://a extra",
+            "main open ../escape codex://threads/new", "main open absent codex://threads/new",
+            "main open work https://example.com/", "main open work codex:threads",
+            "main open work 'codex://'", "main open work 'codex://threads/a b'",
+            "main open work 'codex://threads/new#x'", "main open work 'codex-wo rk://x'",
+            "main open work -a", "main open work 'codexx://threads/new'",
+        ):
+            with self.subTest(command=command):
+                self.run_shell(command, success=False)
+        self.assertFalse((self.root / "launch-args").exists())
 
     def moved_session(self, *, archived=False):
         self.create()
@@ -266,6 +330,91 @@ main launch --all
         self.assertEqual((self.root / "builds").read_text().splitlines(), ["work"])
         self.run_shell("cmd_sync --force work")
         self.assertEqual((self.root / "builds").read_text().splitlines(), ["work", "work"])
+
+    def test_runtime_is_chosen_per_profile_and_survives_sync(self):
+        self.run_shell("cmd_create work --runtime official; cmd_create personal")
+        meta = self.root / "profiles/work/.multicodex"
+        self.assertIn("runtime=official", meta.read_text())
+        self.assertIn("up to date (official runtime)", self.run_shell("cmd_list").stdout)
+        # An ordinary sync keeps each profile's choice, rebuilding neither.
+        self.run_shell("cmd_sync")
+        self.env["TEST_BUILD"] = "11"
+        self.run_shell("cmd_sync")
+        self.assertEqual((self.root / "build-runtimes").read_text().split(),
+                         ["official", "own", "own", "official"])
+        # Changing the runtime rebuilds only the profiles it changes.
+        self.run_shell("cmd_sync --runtime official")
+        self.assertEqual((self.root / "builds").read_text().split()[4:], ["personal"])
+        self.assertIn("runtime=official", (self.root / "profiles/personal/.multicodex").read_text())
+        self.run_shell("cmd_sync --runtime=own work")
+        self.assertIn("runtime=own", meta.read_text())
+        for command in ("cmd_create other --runtime", "cmd_create other --runtime patched",
+                        "cmd_sync --runtime", "cmd_sync --runtime patched"):
+            self.run_shell(command, success=False)
+        self.assertFalse((self.root / "profiles/other").exists())
+
+    def test_open_restarts_the_official_app_on_an_official_runtime_profile(self):
+        self.run_shell("cmd_create work --runtime official")
+        self.index_thread(self.root / "profiles/work", self.THREAD)
+        self.run_shell(f"main open work codex://threads/{self.THREAD}")
+        self.assertEqual((self.root / "launch-args").read_text().splitlines(), [
+            "-n", "-a", str(self.root / "source.app"),
+            "--env", f"CODEX_HOME={self.root}/profiles/work",
+            "--env", f"CODEX_ELECTRON_USER_DATA_PATH={self.root}/data/work",
+            "--args", f"--user-data-dir={self.root}/data/work",
+            f"codex://threads/{self.THREAD}"])
+
+    def test_launchers_start_the_right_binary(self):
+        script = r'''
+profile_app() { printf '%s/apps/Codex %s.app\n' "$TEST_DIR" "$1"; }
+profile_running() { return 1; }
+signing_identity() { printf -- '-\n'; }
+codesign() { :; }
+register_app() { :; }
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+printf '#!/bin/sh\nprintf "%%s\\n" "$0" "$CODEX_HOME" "$@"\n' > "$APP/Contents/MacOS/Chat GPT"
+chmod +x "$APP/Contents/MacOS/Chat GPT"
+/usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string 'Chat GPT'" "$APP/Contents/Info.plist" >/dev/null
+build_profile_app own blue own >/dev/null
+build_profile_app tools green official >/dev/null
+HOME="$TEST_DIR/home" "$(profile_app own)/Contents/MacOS/$LAUNCHER_NAME" one
+HOME="$TEST_DIR/home" "$(profile_app tools)/Contents/MacOS/$LAUNCHER_NAME" two
+rm -rf "$APP"
+HOME="$TEST_DIR/home" "$(profile_app tools)/Contents/MacOS/$LAUNCHER_NAME" 2>&1 || echo "exit $?"
+'''
+        self.env["MULTICODEX_APP"] = str(self.root / "source app.app")
+        lines = self.run_shell(script, harness='source "$TEST_CLI"').stdout.splitlines()
+        data = f"{self.root}/home/Library/Application Support/MultiCodex"
+        self.assertEqual(lines[:8], [
+            f"{self.root}/apps/Codex own.app/Contents/MacOS/Chat GPT",
+            f"{self.root}/profiles/own", f"--user-data-dir={data}/own", "one",
+            f"{self.root}/source app.app/Contents/MacOS/Chat GPT",
+            f"{self.root}/profiles/tools", f"--user-data-dir={data}/tools", "two",
+        ])
+        self.assertIn("multicodex sync tools", lines[-2])
+        self.assertEqual(lines[-1], "exit 1")
+
+    def test_running_detection_finds_the_official_app_on_profile_data(self):
+        script = r'''
+ps() { cat "$TEST_DIR/processes"; }
+profile_running work
+'''
+        data = f"{self.root}/data/work"
+        process_file = self.root / "processes"
+        for wrong in (
+            f"/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            f"/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --user-data-dir={data}2",
+            f"/Applications/ChatGPT.app/Contents/Frameworks/H.app/Contents/MacOS/H --user-data-dir={data}",
+        ):
+            process_file.write_text(wrong + "\n")
+            self.run_shell(script, success=False)
+        for right in (
+            f"/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --user-data-dir={data}",
+            f"/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --user-data-dir={data} codex://threads/new",
+            f"{self.root}/apps/Codex work.app/Contents/MacOS/ChatGPT --user-data-dir={data}",
+        ):
+            process_file.write_text(right + "\n")
+            self.run_shell(script)
 
     def test_launch_all_reports_failure_and_continues(self):
         self.create("broken", "red")

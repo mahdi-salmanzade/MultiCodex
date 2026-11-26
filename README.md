@@ -157,11 +157,13 @@ There is no build step. Updating MultiCodex and updating the official app are se
 | Command | What it does |
 | --- | --- |
 | `multicodex install` | Download, verify, and install the official app. Asks before reinstalling an existing copy. |
-| `multicodex create <name> [--color <color>]` | Create an isolated profile and its branded, locally re-signed app. |
+| `multicodex create <name> [--color <color>] [--runtime own\|official]` | Create an isolated profile and its branded, locally re-signed app. See [runtimes](#chat-tools-and-chat-links). |
 | `multicodex launch <name>` | Launch with the profile's isolation settings. |
 | `multicodex launch --all` | Start every profile in sequence, skipping those already running. Aliases: `launch -a`, `open-all`, `openall`. |
+| `multicodex open <name\|default> <codex://link>` | Open a chat link (`… > Copy > Copy Deeplink`) in one chosen profile, or in the official app with `default`. |
 | `multicodex list` | Show profiles, colors, local auth-file presence, and sync status. Alias: `ls`. |
-| `multicodex sync [name]` | Rebuild stale or missing profile apps from the installed source app. |
+| `multicodex sync [--force] [name]` | Rebuild stale or missing profile apps from the installed source app; `--force` rebuilds regardless. |
+| `multicodex sync --runtime own\|official [name]` | Switch profiles between their own re-signed copy and the untouched official app. |
 | `multicodex repair <name> [--from /old/profile/home]` | Restore access to sessions after moving a profile; defaults to the old `~/.codex-profiles/<name>` location. |
 | `multicodex sessions sync <name> [--with <peer>]` | Sync conversations and message history both ways with `default` Codex or a named peer. Requires Python 3. |
 | `multicodex sessions enable <name> [--with <peer>]` | Sync now and install a local agent that repeats every 15 seconds and at login. |
@@ -173,7 +175,7 @@ There is no build step. Updating MultiCodex and updating the official app are se
 | `multicodex --help` | Show usage. |
 | `multicodex --version` | Show the MultiCodex version. |
 
-Profile names accept letters, digits, dots, underscores, and hyphens; `.` and `..` are invalid. Use simple names such as `work`, `personal`, or `client-one`.
+Profile names accept letters, digits, dots, underscores, and hyphens. A name cannot start with a dot, and `default` is reserved for the official app's own profile. Use simple names such as `work`, `personal`, or `client-one`.
 
 **Colors:** blue, green, purple, orange, red, teal, pink, yellow, indigo, graphite. Once all colors are used, automatic selection falls back to blue.
 
@@ -212,6 +214,29 @@ The first run backs up both conversation indexes and message-history databases u
 
 Automatic sync runs through a macOS LaunchAgent while you are logged in. Keep Python 3 and this checkout's `tools` directory available. After the first import, reopen the app if its sidebar is cached. See [sync behavior and limitations](docs/TROUBLESHOOTING.md#shared-conversations-are-missing-or-out-of-date).
 
+### Chat tools and chat links
+
+**Letting one chat read another.** Codex can read, list, and message other chats from inside a chat, for example `Read codex://threads/<id>`. The app serves those tools only to processes signed by OpenAI, and a profile is a re-signed copy, so in a profile they fail to start and the chat cannot see the others. To get them back, run a profile on the untouched official app:
+
+```sh
+multicodex sync --runtime official work     # one profile
+multicodex sync --runtime official          # every profile
+multicodex create client --runtime official # a new one
+```
+
+The profile keeps its account, data, name, and colored icon in Finder and Spotlight. While it runs, though, it is the official app as far as macOS is concerned: its Dock tile and Cmd-Tab entry show the official name and icon, and it shares the official app's privacy grants. `multicodex sync --runtime own work` switches back. `list` shows which profiles use the official runtime.
+
+A chat can only read chats its own profile knows about. To reach chats from another profile, [share conversations](#optional-shared-conversations) between the two first.
+
+**Opening a chat link in a profile.** macOS hands every `codex://` link to a single application, and the app ignores links under any other scheme, so a copied link cannot pick a profile on its own. Name the profile instead:
+
+```sh
+multicodex open work 'codex://threads/01a13644-6619-79b2-a18d-e9b6e9ea76bd'
+multicodex open default 'codex://threads/01a13644-6619-79b2-a18d-e9b6e9ea76bd'
+```
+
+This works whether or not the profile is running. If the chat belongs to a different profile, `open` says which one and how to share it.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -230,11 +255,12 @@ Re-signing is necessary because changing app metadata invalidates the original s
 1. Clone the installed official application, using APFS copy-on-write when available.
 2. Set the profile's display name, bundle identifier (`local.multicodex.<name>`), and colored icon.
 3. Remove `CFBundleIconName` so the app's asset catalog does not override the replacement `.icns`.
-4. Give the copy a URL scheme of its own (`codex-<name>:`) and drop its claim on `codex:`, `http:` and `https:`.
-5. Re-sign and verify the copy, then register it with Launch Services.
-6. Launch with `CODEX_HOME`, `CODEX_ELECTRON_USER_DATA_PATH`, and `--user-data-dir` pointing at the profile's directories.
+4. Give the copy a URL scheme of its own (`codex-<name>:`) and drop its declared claim on `codex:`, `http:` and `https:`.
+5. Install a launcher as the copy's main executable, which starts either the copy or, on the official runtime, the untouched official app, on the profile's directories.
+6. Re-sign and verify the copy, then register it with Launch Services.
+7. Launch with `CODEX_HOME`, `CODEX_ELECTRON_USER_DATA_PATH`, and `--user-data-dir` pointing at the profile's directories.
 
-Step 4 matters more than it looks. macOS binds one application to each URL scheme, and the app claims `codex:` as it starts. A clone that inherited that claim would take every `codex://` link on the machine the moment it was launched — including the OAuth callback that finishes an MCP login, which would then open in whichever profile ran most recently rather than the one that began the login. Giving each profile a private scheme leaves `codex:` with the official app. `multicodex doctor` reports which application currently holds it.
+Step 4 is only half a fix. macOS binds one application to each URL scheme, and a clone that declared `codex:` would be offered every `codex://` link on the machine, including the OAuth callback that finishes an MCP login. Removing the declaration stops that at build time, but the app also claims `codex:` itself each time it starts, so a profile on its own runtime still takes the scheme until the official app is opened again. `multicodex doctor` reports which application currently holds it. A profile on the official runtime is the official app and leaves the scheme where it was. The app accepts links only under `codex:`, so the private scheme does not carry chat links; use `multicodex open` for those.
 
 Both environment variables matter. In the app behavior this tool was developed against, setting only `CODEX_HOME` can be overridden by the app's login-shell environment loading. The Electron data path keeps the profile configuration separate.
 

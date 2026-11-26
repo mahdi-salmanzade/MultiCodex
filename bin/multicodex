@@ -43,6 +43,10 @@ readonly ICON_DIR="${MULTICODEX_ICONS:-$SELF/assets/icons}"
 
 readonly COLORS="blue green purple orange red teal pink yellow indigo graphite"
 readonly LAUNCHER_NAME="multicodex-launcher"
+# What a profile's launcher starts: "own", its re-signed copy, which macOS
+# treats as a separate application; or "official", the untouched official app,
+# whose signature the built-in chat tools insist on.
+readonly RUNTIMES="own official"
 readonly LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 # ---------------------------------------------------------------- output
@@ -87,6 +91,12 @@ default_url_handler() {
     '
 }
 
+valid_runtime() {
+    local r
+    for r in $RUNTIMES; do [ "$r" = "$1" ] && return 0; done
+    return 1
+}
+
 codex_home()  { printf '%s/%s\n' "$PROFILE_ROOT" "$1"; }
 legacy_codex_home() { printf '%s/.codex-profiles/%s\n' "$HOME" "$1"; }
 data_dir()    { printf '%s/%s\n' "$DATA_ROOT" "$1"; }
@@ -97,6 +107,16 @@ meta_get() {
     local f
     f="$(meta_file "$1")"
     [ -f "$f" ] && sed -n "s/^$2=//p" "$f" | head -1 || true
+}
+
+profile_runtime() {
+    local r
+    r="$(meta_get "$1" runtime)"
+    printf '%s\n' "${r:-own}"
+}
+
+write_meta() {
+    printf 'color=%s\nsource_version=%s\nsource_build=%s\nruntime=%s\n' "$2" "$3" "$4" "$5" > "$(meta_file "$1")"
 }
 
 app_version() {
@@ -123,14 +143,25 @@ next_color() {
 
 require_app() { [ -d "$APP" ] || die "ChatGPT is not installed. Run: multicodex install"; }
 
-# True when a profile's own application is running. Matching on the bundle path
-# avoids false positives from its Computer Use helper, which lives under the
-# profile directory and outlives the app.
+# True when a profile's application is running: either its own copy, found by
+# bundle path, or the official app started on the profile's data directory.
+# Helpers are skipped; they live under Frameworks or deeper in the bundle, and
+# the Computer Use helper outlives the app.
 profile_running() {
-    ps -axo comm= 2>/dev/null | awk -v prefix="$(profile_app "$1")/Contents/MacOS/" '
+    ps -axww -o command= 2>/dev/null | awk \
+        -v prefix="$(profile_app "$1")/Contents/MacOS/" \
+        -v data=" --user-data-dir=$(data_dir "$1")" '
         index($0, prefix) == 1 {
             executable = substr($0, length(prefix) + 1)
+            sub(/ .*/, "", executable)
             if (executable != "" && index(executable, "/") == 0) found = 1
+        }
+        index($0, "/Contents/MacOS/") && !index($0, "/Contents/Frameworks/") {
+            at = index($0, data)
+            if (at) {
+                rest = substr($0, at + length(data))
+                if (rest == "" || substr(rest, 1, 1) == " ") found = 1
+            }
         }
         END { exit !found }
     '
@@ -141,6 +172,11 @@ profile_running() {
 # it is instant and loses nothing.
 refresh_icon_cache() {
     killall Dock >/dev/null 2>&1 || true
+}
+
+register_app() {
+    [ -x "$LSREGISTER" ] || return 0
+    "$LSREGISTER" -f "$1" >/dev/null 2>&1 || true
 }
 
 # Prefer a team-backed certificate: ad-hoc signatures change on every re-sign,
@@ -268,7 +304,7 @@ namespace_url_schemes() {
 
 # Clone, rebrand and re-sign one profile application.
 build_profile_app() {
-    local name="$1" color="$2" target
+    local name="$1" color="$2" runtime="${3:-own}" target
     target="$(profile_app "$name")"
 
     # Building replaces the bundle on disk, and a running profile still reads
@@ -283,7 +319,7 @@ build_profile_app() {
     [ "$identity" = "-" ] && warn "no signing certificate found; using an ad-hoc signature (privacy grants may reset on each sync)"
 
     info "cloning $(app_version "$APP") (copy-on-write)"
-    mkdir -p "$APP_DIR"
+    mkdir -p "$(dirname -- "$target")"
     rm -rf "$target"
     cp -Rc "$APP" "$target" 2>/dev/null || cp -R "$APP" "$target"
 
@@ -321,6 +357,18 @@ build_profile_app() {
     macos="$target/Contents/MacOS"
     real="$(defaults read "$plist" CFBundleExecutable 2>/dev/null || echo ChatGPT)"
     if [ "$real" != "$LAUNCHER_NAME" ] && [ -x "$macos/$real" ]; then
+        # The app's chat tools (read_thread, list_threads, send_message_to_thread)
+        # are served over a pipe that admits only processes whose ancestry is
+        # signed by OpenAI. A re-signed copy is turned away by its own tools, so
+        # the "official" runtime starts the untouched app on this profile's
+        # directories instead, at the cost of its separate Dock identity.
+        local binary
+        if [ "$runtime" = "official" ]; then
+            printf -v binary '%q' "$APP/Contents/MacOS/$real"
+        else
+            printf -v binary '%q' "$real"
+            binary="\"\$here\"/$binary"
+        fi
         cat > "$macos/$LAUNCHER_NAME" <<LAUNCHER
 #!/bin/bash
 set -eu
@@ -333,13 +381,18 @@ home="\${MULTICODEX_ROOT:-\$HOME/.multicodex/profiles}/\$profile"
 data="\$HOME/Library/Application Support/MultiCodex/\$profile"
 mkdir -p -m 700 "\$home" "\$data" 2>/dev/null || true
 
+binary=$binary
+if [ ! -x "\$binary" ]; then
+    printf 'MultiCodex: nothing to run at %s\\nRun: multicodex sync %s\\n' "\$binary" "\$profile" >&2
+    exit 1
+fi
 export CODEX_HOME="\$home"
 export CODEX_ELECTRON_USER_DATA_PATH="\$data"
-exec "\$here/$real" --user-data-dir="\$data" "\$@"
+exec "\$binary" --user-data-dir="\$data" "\$@"
 LAUNCHER
         chmod +x "$macos/$LAUNCHER_NAME"
         /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $LAUNCHER_NAME" "$plist" >/dev/null 2>&1 || true
-        ok "self-contained launcher installed"
+        ok "self-contained launcher installed ($runtime runtime)"
     fi
 
     info "re-signing as '$identity'"
@@ -349,22 +402,31 @@ LAUNCHER
         || die "signature verification failed for $target"
     ok "signed and verified"
 
-    [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$target" >/dev/null 2>&1 || true
+    register_app "$target"
     printf '%s\n' "$target"
 }
 
 cmd_create() {
-    local name="" color=""
+    local name="" color="" runtime="own"
     while [ $# -gt 0 ]; do
         case "$1" in
             --color) [ $# -ge 2 ] && [ -n "$2" ] || die "--color requires a value"; color="$2"; shift 2 ;;
             --color=*) color="${1#--color=}"; shift ;;
+            --runtime) [ $# -ge 2 ] && [ -n "$2" ] || die "--runtime requires a value"; runtime="$2"; shift 2 ;;
+            --runtime=*) runtime="${1#--runtime=}"; shift ;;
             -*) die "unknown option: $1" ;;
             *) [ -z "$name" ] || die "specify one profile name"; name="$1"; shift ;;
         esac
     done
-    [ -n "$name" ] || die "usage: multicodex create <name> [--color <colour>]"
+    [ -n "$name" ] || die "usage: multicodex create <name> [--color <colour>] [--runtime own|official]"
+    valid_runtime "$runtime" || die "unknown runtime '$runtime' (own or official)"
     valid_name "$name" || die "invalid name '$name' (letters, digits, . _ - only)"
+    # "default" already means the official app's own home, and a leading dot
+    # would hide the profile from every command that lists them.
+    case "$name" in
+        default) die "'default' is reserved for the official app's own profile" ;;
+        .*) die "invalid name '$name' (must not start with a dot)" ;;
+    esac
     require_app
     [ -d "$(codex_home "$name")" ] && die "profile '$name' already exists"
 
@@ -376,10 +438,10 @@ cmd_create() {
     profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"
     mkdir -p "$profile_home" "$data"
     chmod 700 "$profile_home" "$data"
-    build_profile_app "$name" "$color"
+    build_profile_app "$name" "$color" "$runtime"
     app="$(profile_app "$name")"
 
-    printf 'color=%s\nsource_version=%s\nsource_build=%s\n' "$color" "$(app_version "$APP")" "$(app_build "$APP")" > "$(meta_file "$name")"
+    write_meta "$name" "$color" "$(app_version "$APP")" "$(app_build "$APP")" "$runtime"
 
     printf '\n'
     ok "app         $app"
@@ -388,22 +450,25 @@ cmd_create() {
 
     printf '\n'
     info "launch:  multicodex launch $name"
-    info "always launch through multicodex so this profile receives its isolated settings"
+    info "Codex $name also opens from Finder, Spotlight or the Dock"
 }
 
 cmd_sync() {
-    local force="false"
+    local force="false" want=""
     local args=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --force|-f) force="true"; shift ;;
+            --runtime) [ $# -ge 2 ] && [ -n "$2" ] || die "--runtime requires a value"; want="$2"; shift 2 ;;
+            --runtime=*) want="${1#--runtime=}"; shift ;;
             -*) die "unknown option: $1" ;;
             *) args="$args $1"; shift ;;
         esac
     done
     # shellcheck disable=SC2086
     set -- $args
-    [ $# -le 1 ] || die "usage: multicodex sync [--force] [name]"
+    [ $# -le 1 ] || die "usage: multicodex sync [--force] [--runtime own|official] [name]"
+    [ -z "$want" ] || valid_runtime "$want" || die "unknown runtime '$want' (own or official)"
     if [ $# -eq 1 ]; then valid_name "$1" || die "invalid name '$1'"; fi
     require_app
     local current current_build targets name
@@ -422,9 +487,11 @@ cmd_sync() {
     for name in $targets; do
         valid_name "$name" || { warn "skipping invalid profile name '$name'"; continue; }
         [ -d "$(codex_home "$name")" ] || { warn "no profile '$name'"; continue; }
-        local was color
+        local was color runtime
         was="$(meta_get "$name" source_version)"
         color="$(meta_get "$name" color)"
+        runtime="$(profile_runtime "$name")"
+        valid_runtime "$runtime" || runtime="own"
         if [ -z "$color" ]; then
             # No colour on record (an older layout, or hand-made directory).
             # Claim an unused one so profiles stay visually distinct instead of
@@ -433,6 +500,7 @@ cmd_sync() {
             printf 'color=%s\n' "$color" > "$(meta_file "$name")"
         fi
         if [ "$force" = "false" ] \
+            && [ "${want:-$runtime}" = "$runtime" ] \
             && [ "$was" = "$current" ] \
             && [ "$(meta_get "$name" source_build)" = "$current_build" ] \
             && [ -d "$(profile_app "$name")" ] \
@@ -440,12 +508,13 @@ cmd_sync() {
             ok "$name already on $current"
             continue
         fi
-        printf '\n'; bold "  $name ($was -> $current)"
-        if ! build_profile_app "$name" "$color" >/dev/null; then
+        runtime="${want:-$runtime}"
+        printf '\n'; bold "  $name ($was -> $current, $runtime runtime)"
+        if ! build_profile_app "$name" "$color" "$runtime" >/dev/null; then
             warn "$name not updated"
             continue
         fi
-        printf 'color=%s\nsource_version=%s\nsource_build=%s\n' "$color" "$current" "$current_build" > "$(meta_file "$name")"
+        write_meta "$name" "$color" "$current" "$current_build" "$runtime"
         ok "$name updated"
     done
     refresh_icon_cache
@@ -552,6 +621,126 @@ repair_legacy_paths_on_launch() {
     return 0
 }
 
+# Checks shared by every way of starting a profile's application.
+prepare_profile() {
+    local name="$1" profile_home data app
+    profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"; app="$(profile_app "$name")"
+    [ -d "$profile_home" ] || die "no profile named '$name' (create it: multicodex create $name)"
+    [ -d "$app" ] || die "profile app missing — run: multicodex sync $name"
+    mkdir -p "$profile_home" "$data"
+    chmod 700 "$profile_home" "$data"
+    repair_legacy_paths_on_launch "$name"
+}
+
+# The home whose conversation index lists a thread: "default", a profile name,
+# or nothing when no index has it (or sqlite3 is unavailable).
+thread_owner() {
+    local id="$1" dir name db
+    command -v sqlite3 >/dev/null 2>&1 || return 0
+    for dir in "$HOME/.codex" "$PROFILE_ROOT"/*/; do
+        [ -d "$dir" ] || continue
+        for db in "${dir%/}"/state_*.sqlite; do
+            [ -f "$db" ] || continue
+            if [ -n "$(sqlite3 -readonly "$db" "SELECT 1 FROM threads WHERE id = '$id' LIMIT 1;" 2>/dev/null)" ]; then
+                if [ "${dir%/}" = "$HOME/.codex" ]; then name="default"; else name="$(basename "$dir")"; fi
+                printf '%s\n' "$name"
+                return 0
+            fi
+        done
+    done
+}
+
+profile_has_thread() {
+    local db
+    for db in "$(codex_home "$1")"/state_*.sqlite; do
+        [ -f "$db" ] || continue
+        [ -n "$(sqlite3 -readonly "$db" "SELECT 1 FROM threads WHERE id = '$2' LIMIT 1;" 2>/dev/null)" ] && return 0
+    done
+    return 1
+}
+
+# Open a Codex link in one chosen profile. macOS gives `codex:` to a single
+# application, so a copied chat link always lands in whichever app holds the
+# scheme; and the app ignores any link that does not start with `codex:`, so a
+# profile's own `codex-<name>:` scheme cannot carry one either. Handing the
+# link to the profile's application directly sidesteps both.
+cmd_open() {
+    local name="${1:-}" url="${2:-}"
+    [ $# -eq 2 ] && [ -n "$name" ] && [ -n "$url" ] \
+        || die "usage: multicodex open <name|default> <codex://link>"
+    valid_name "$name" || die "invalid name '$name'"
+
+    local rest
+    case "$url" in
+        [Cc][Oo][Dd][Ee][Xx]://*) rest="${url#*://}" ;;
+        [Cc][Oo][Dd][Ee][Xx]-*://*)
+            # A link written for a profile's private scheme means the same thing.
+            printf '%s' "${url%%://*}" | grep -qE '^[A-Za-z0-9.+-]+$' \
+                || die "not a Codex link: $url"
+            rest="${url#*://}" ;;
+        *) die "not a Codex link: $url (expected codex://…, e.g. from Copy > Copy Deeplink)" ;;
+    esac
+    printf '%s' "$rest" | LC_ALL=C grep -q '[[:space:][:cntrl:]#]' \
+        && die "not a Codex link: $url"
+    [ -n "$rest" ] || die "not a Codex link: $url"
+    url="codex://$rest"
+
+    # A chat exists only in the homes whose index lists it. Say where it lives
+    # instead of letting the app open on an error.
+    local id owner
+    id="$(printf '%s' "$rest" | sed -nE 's#^threads/([0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12})([/?].*)?$#\1#p')"
+
+    if [ "$name" = "default" ]; then
+        require_app
+        open -a "$APP" "$url" || die "could not open the link in $APP"
+        ok "opened in the official app"
+        return 0
+    fi
+
+    local profile_home data app
+    profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"; app="$(profile_app "$name")"
+    prepare_profile "$name"
+
+    if [ -n "$id" ] && command -v sqlite3 >/dev/null 2>&1 \
+        && ls "$profile_home"/state_*.sqlite >/dev/null 2>&1 \
+        && ! profile_has_thread "$name" "$id"; then
+        owner="$(thread_owner "$id")"
+        if [ -n "$owner" ]; then
+            warn "this chat belongs to '$owner' and is not shared with '$name' yet"
+            if [ "$owner" = "default" ]; then
+                warn "share it first: multicodex sessions sync $name"
+            else
+                warn "share it first: multicodex sessions sync $name --with $owner"
+            fi
+        else
+            warn "this chat is not in any profile on this Mac; '$name' may not be able to open it"
+        fi
+    fi
+
+    # No -n: a running profile must receive the link itself rather than have a
+    # second copy start beside it. Only a fresh start can be given settings.
+    if [ "$(profile_runtime "$name")" = "official" ]; then
+        # This profile runs as the official app, which macOS cannot address
+        # apart from the default instance. A second start on the profile's data
+        # directory hands the link to the running one and exits, or becomes it.
+        require_app
+        open -n -a "$APP" \
+            --env "CODEX_HOME=$profile_home" \
+            --env "CODEX_ELECTRON_USER_DATA_PATH=$data" \
+            --args --user-data-dir="$data" "$url" \
+            || die "could not open the link in $APP"
+    elif profile_running "$name"; then
+        open -a "$app" "$url" || die "could not open the link in $app"
+    else
+        open -a "$app" \
+            --env "CODEX_HOME=$profile_home" \
+            --env "CODEX_ELECTRON_USER_DATA_PATH=$data" \
+            "$url" --args --user-data-dir="$data" \
+            || die "could not open the link in $app"
+    fi
+    ok "opened in Codex $name"
+}
+
 cmd_launch() {
     local name="${1:-}"
     [ -n "$name" ] || die "usage: multicodex launch <name>"
@@ -559,11 +748,7 @@ cmd_launch() {
 
     local profile_home data app
     profile_home="$(codex_home "$name")"; data="$(data_dir "$name")"; app="$(profile_app "$name")"
-    [ -d "$profile_home" ] || die "no profile named '$name' (create it: multicodex create $name)"
-    [ -d "$app" ] || die "profile app missing — run: multicodex sync $name"
-    mkdir -p "$profile_home" "$data"
-    chmod 700 "$profile_home" "$data"
-    repair_legacy_paths_on_launch "$name"
+    prepare_profile "$name"
 
     # Launch through `open -n` so the app is adopted by launchd rather than
     # parented to this shell. Exec'ing the binary directly works, but ties the
@@ -619,6 +804,7 @@ cmd_list() {
             ver="$(meta_get "$name" source_version)"
             if [ "$ver" = "$current" ] && [ "$(meta_get "$name" source_build)" = "$current_build" ]; then
                 status="up to date"
+                [ "$(profile_runtime "$name")" = "official" ] && status="up to date (official runtime)"
             else
                 status="stale — run sync"
             fi
@@ -647,7 +833,8 @@ cmd_remove() {
     # A sync agent left behind would fail every 15 seconds on the missing home.
     local plist
     for plist in "$HOME"/Library/LaunchAgents/local.multicodex.sessions.*.plist; do
-        [ -f "$plist" ] && grep -qF "<string>$profile_home</string>" "$plist" || continue
+        [ -f "$plist" ] || continue
+        grep -qF "<string>$profile_home</string>" "$plist" || continue
         launchctl bootout "gui/$(id -u)/$(basename "$plist" .plist)" >/dev/null 2>&1 || true
         rm -f "$plist"
         ok "stopped its session sync"
@@ -687,6 +874,7 @@ cmd_doctor() {
     else
         warn "codex: links open '$handler' — deep links and MCP logins land in that profile"
         warn "each app re-claims codex: as it starts; reopen the official app last to take it back"
+        warn "to send a link to one profile regardless: multicodex open <name> <link>"
     fi
 
     local identity; identity="$(signing_identity)"
@@ -702,8 +890,21 @@ cmd_doctor() {
         warn "session sync failing: $(sed -E 's/.*"error": "([^"]*)".*/\1/' "$failure")"
     done
 
-    local n=0 icons=0
-    [ -d "$PROFILE_ROOT" ] && n="$(find "$PROFILE_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+    # Count what `list` shows; the root can also hold hidden folders.
+    local n=0 icons=0 own="" dir
+    if [ -d "$PROFILE_ROOT" ]; then
+        for dir in "$PROFILE_ROOT"/*/; do
+            [ -d "$dir" ] || continue
+            n=$((n + 1))
+            [ -d "$(profile_app "$(basename "$dir")")" ] \
+                && [ "$(profile_runtime "$(basename "$dir")")" != "official" ] \
+                && own="$own $(basename "$dir")"
+        done
+    fi
+    if [ -n "$own" ]; then
+        info "on their own runtime:$own"
+        info "chats there cannot read or message other chats; to allow it: multicodex sync --runtime official <name>"
+    fi
     [ -d "$ICON_DIR" ] && icons="$(find "$ICON_DIR" -name 'multicodex-*.icns' 2>/dev/null | wc -l | tr -d ' ')"
     ok "$n profile(s), $icons/10 colour icons"
     [ -d / ] && case "$(diskutil info / 2>/dev/null | sed -n 's/.*File System Personality: *//p')" in
@@ -717,11 +918,16 @@ usage() {
 multicodex $VERSION — several ChatGPT/Codex accounts on one Mac
 
   multicodex install                    download and install the latest ChatGPT
-  multicodex create <name> [--color c]  create a profile with its own app
+  multicodex create <name> [--color c] [--runtime own|official]
+                                        create a profile with its own app
   multicodex launch <name>              launch a profile
   multicodex launch --all               launch every profile
+  multicodex open <name> <codex://link> open a chat link in a profile (or default)
   multicodex list                       list profiles and their state
   multicodex sync [--force] [name]      rebuild profiles after a ChatGPT update
+  multicodex sync --runtime official [name]
+                                        run profiles on the untouched official app,
+                                        which the built-in chat tools require
   multicodex repair <name> [--from path] restore access after moving a profile
   multicodex sessions sync <name>       sync chats both ways with default Codex
   multicodex sessions enable <name>     keep chats synced every 15 seconds
@@ -748,6 +954,7 @@ main() {
             if [ "${1:-}" = "--all" ] || [ "${1:-}" = "-a" ]; then cmd_launch_all
             else cmd_launch "$@"; fi ;;
         open-all|openall) cmd_launch_all ;;
+        open)    cmd_open "$@" ;;
         sync)    cmd_sync "$@" ;;
         repair)  cmd_repair "$@" ;;
         sessions) cmd_sessions "$@" ;;

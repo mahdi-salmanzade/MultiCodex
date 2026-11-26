@@ -26,7 +26,7 @@ That setting also changes the install destination. Keep it consistent across ter
 
 ## Two profiles show the same account
 
-Quit the affected profile apps, then launch each using `multicodex launch <name>`. A direct Finder, Spotlight, or Dock launch does not inject `CODEX_HOME` and `CODEX_ELECTRON_USER_DATA_PATH`. Use the Dock to switch to an already running profile, and use the CLI to start it again after quitting.
+Profiles built before 1.0.1 have no launcher of their own and open the shared account when started from Finder, Spotlight, or the Dock. Quit the affected profile apps, run `multicodex sync --force`, and start them again. Current profiles carry their settings however they are started.
 
 Fresh profiles require their own sign-in. MultiCodex does not copy your existing default account's credentials or settings into them.
 
@@ -34,7 +34,7 @@ Fresh profiles require their own sign-in. MultiCodex does not copy your existing
 
 Quit the profile, confirm `MULTICODEX_APP` points to the updated source, and run `multicodex sync <name>`. Then relaunch with the CLI. Both `CFBundleShortVersionString` and `CFBundleVersion` are tracked. Profiles created before build tracking are rebuilt on their next sync.
 
-Sync skips profiles whose recorded version/build match and whose app exists. It is not a repair or force-rebuild command for arbitrary bundle damage. Report that case before deleting profile data.
+Sync skips profiles whose recorded version/build match and whose app exists. To rebuild one anyway, for example after its bundle was damaged, run `multicodex sync --force <name>`. Profile data is not touched.
 
 ## A conversation fails with `failed to resolve rollout path`
 
@@ -55,6 +55,26 @@ multicodex repair work --from /absolute/path/to/old/work
 Use the old home shown in your error, belonging to that same profile. The command creates a compatibility symlink and refuses to replace an occupied path. Keep the link in place while saved records reference it. This restores access without rewriting the conversation database or copying credentials. Reopen the conversation; if the app still shows the cached error, quit the affected profile and relaunch it with `multicodex launch work`.
 
 If the old location already exists, inspect it before changing anything. If the rollout file is also missing from the new home, a symlink cannot recover it; restore it from the original profile or a backup. Changing `MULTICODEX_ROOT` or running `sync` does not migrate saved paths.
+
+## A chat cannot read, list, or message other chats
+
+Asking a chat in a profile to `Read codex://threads/<id>`, or to list or message other chats, fails or the tools are missing. The app serves these tools only to processes signed by OpenAI, and a profile's re-signed copy is not. Run the profile on the untouched official app instead:
+
+```sh
+multicodex sync --runtime official work
+```
+
+Quit the profile first. It keeps its account and data, and shows the official name and icon in the Dock while it runs. `multicodex doctor` lists the profiles still on their own runtime. If the chat you want lives in another profile, also [share conversations](#shared-conversations-are-missing-or-out-of-date) between the two.
+
+## A chat link opens in the wrong app
+
+macOS gives `codex://` links to one application, usually whichever Codex app started last. Send a link to a specific profile with:
+
+```sh
+multicodex open work 'codex://threads/<id>'
+```
+
+`multicodex doctor` shows which application holds `codex:`. Opening the official app again hands it back.
 
 ## Shared conversations are missing or out of date
 

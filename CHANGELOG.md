@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Let chats in a profile read, list, and message other chats again (#1). The app serves those tools only to processes signed by OpenAI, so a re-signed profile's own tools turned it away and requests like `Read codex://threads/<id>` failed. `create --runtime official` and `sync --runtime official [name]` run a profile on the untouched official app with the profile's own account and data; it then shows the official name and icon in the Dock while running. The default is unchanged. Diagnosis and approach from @mdibaiee in #2.
+- Add `open <name|default> <codex://link>` to open a chat link in one chosen profile. macOS gives `codex:` to a single application and the app ignores every other scheme, so a copied link could not select a profile. `open` also says which profile a chat belongs to when the target does not have it.
+- Fix sidebar sync treating a profile as closed when its app had been started with a link.
+- Reserve the profile name `default`, which already meant the official app in `sessions`, and refuse names starting with a dot, which every listing skipped.
+- Count only real profiles in `doctor`; hidden folders in the profile root were included.
+- Fix the lint failure that had kept CI red since the previous change.
+- Correct the troubleshooting guide: profiles open correctly from Finder and the Dock since 1.0.1, and `sync --force` exists.
+
 - Keep syncing conversations after Codex compresses them. Codex now stores finished rollouts as `<name>.jsonl.zst` while still recording `<name>.jsonl`, so sync treated them as missing and silently skipped those conversations. Launch-time path repair had the same blind spot.
 - Copy only a project's shared fields between apps, so a backing tied to one ChatGPT account cannot reach another.
 - Stop the sync agent's logs growing without limit.

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -216,10 +217,12 @@ def app_running(home):
         head, _, args = command.partition(marker)
         if args and not args.startswith(" "):
             continue
-        data = [a for a in args.split(" --") if a.startswith("user-data-dir=")]
+        data = [a.split("=", 1)[1] for a in args.split(" --") if a.startswith("user-data-dir=")]
         if default and not data:
             return True
-        if not default and any(Path(a.split("=", 1)[1].strip()).name == home.name for a in data):
+        # The directory can be followed by a link the app was started with.
+        data = [re.sub(r" [A-Za-z][A-Za-z0-9+.-]*:\S*$", "", value.rstrip()) for value in data]
+        if not default and any(Path(value).name == home.name for value in data):
             return True
     return False
 
